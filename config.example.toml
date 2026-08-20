@@ -1,0 +1,31 @@
+# Copy this file to config.toml and set the environment variable named below.
+[providers.main]
+base_url = "https://api.openai.com/v1"
+api_key_env = "OPENAI_API_KEY"
+reasoning_fields = ["reasoning_content", "thinking"]
+
+[game]
+seed = 17
+player_ids = ["alice", "bob", "carol", "david", "eve"]
+history_directory = "history"
+discussion_action_budget = 40
+discussion_quiet_windows = 3
+private_chat_action_budget = 8
+private_chat_quiet_windows = 2
+
+[models.global]
+provider = "main"
+name = "gpt-5-mini"
+
+[models.global_short]
+provider = "main"
+name = "gpt-5-mini"
+
+# Optional player-specific overrides:
+#[players.alice.model]
+#provider = "main"
+#name = "gpt-5-mini"
+#
+#[players.alice.short_model]
+#provider = "main"
+#name = "gpt-5-mini"

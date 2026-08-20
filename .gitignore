@@ -1,1 +1,10 @@
 .worktrees/
+.venv/
+__pycache__/
+.pytest_cache/
+*.egg-info/
+.superpowers/
+history/
+config.toml
+web/node_modules/
+web/dist/

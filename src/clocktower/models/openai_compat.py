@@ -316,16 +316,16 @@ class OpenAICompatibleAdapter:
                 raise _ProviderPayloadError()
             state = tool_states.setdefault((choice_index, tool_index), _ToolCallState())
             if isinstance(tool_call.get("id"), str):
-                state.tool_call_id = tool_call["id"]
+                state.tool_call_id = OpenAICompatibleAdapter._merge_identity_fragment(state.tool_call_id, tool_call["id"])
             if isinstance(tool_call.get("type"), str):
-                state.tool_type = tool_call["type"]
+                state.tool_type = OpenAICompatibleAdapter._merge_identity_fragment(state.tool_type, tool_call["type"])
             function = tool_call.get("function")
             arguments = ""
             if function is not None:
                 if not isinstance(function, Mapping):
                     raise _ProviderPayloadError()
                 if isinstance(function.get("name"), str):
-                    state.tool_name = OpenAICompatibleAdapter._append_fragment(state.tool_name, function["name"])
+                    state.tool_name = OpenAICompatibleAdapter._merge_identity_fragment(state.tool_name, function["name"])
                 if isinstance(function.get("arguments"), str):
                     arguments = function["arguments"]
             parts.append(_SegmentPart(
@@ -381,14 +381,14 @@ class OpenAICompatibleAdapter:
         )
 
     @staticmethod
-    def _append_fragment(current: str | None, fragment: str) -> str:
+    def _merge_identity_fragment(current: str | None, incoming: str) -> str:
         if not current:
-            return fragment
-        max_overlap = min(len(current), len(fragment))
-        for overlap in range(max_overlap, 0, -1):
-            if current[-overlap:] == fragment[:overlap]:
-                return current + fragment[overlap:]
-        return current + fragment
+            return incoming
+        if incoming == current or current.startswith(incoming):
+            return current
+        if incoming.startswith(current):
+            return incoming
+        return current + incoming
 
     @staticmethod
     def _safe_error(error: Exception) -> ModelCallError:

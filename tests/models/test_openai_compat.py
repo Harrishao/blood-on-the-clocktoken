@@ -246,3 +246,62 @@ async def test_httpx_read_error_is_an_interruption_and_is_redacted(mock_transpor
         await collect(adapter(mock_transport), sample_request(api_key="super-secret"))
 
     assert "super-secret" not in str(caught.value)
+
+
+async def test_split_tool_identity_fields_are_appended_exactly_without_crossing_indexes(mock_transport: ScriptedSSETransport):
+    mock_transport.script([
+        delta(tool_calls=[{
+            "index": 0,
+            "id": "call_",
+            "type": "func",
+            "function": {"name": "book", "arguments": '{"notes":"x'},
+        }]),
+        delta(tool_calls=[{
+            "index": 0,
+            "id": "123",
+            "type": "tion",
+            "function": {"name": "keeper", "arguments": '"}'},
+        }]),
+        delta(tool_calls=[{
+            "index": 1,
+            "id": "call_other",
+            "type": "function",
+            "function": {"name": "other", "arguments": '{"text":"y"}'},
+        }]),
+        "data: [DONE]",
+    ])
+
+    segments = await collect(adapter(mock_transport), sample_request())
+
+    assert [(segment.text, segment.tool_index, segment.tool_call_id, segment.tool_type, segment.tool_name) for segment in segments if segment.kind == "tool_call"] == [
+        ('{"notes":"x"}', 0, "call_123", "function", "bookkeeper"),
+        ('{"text":"y"}', 1, "call_other", "function", "other"),
+    ]
+
+
+async def test_complete_duplicate_tool_identity_snapshot_is_not_appended_twice(mock_transport: ScriptedSSETransport):
+    mock_transport.script([
+        delta(tool_calls=[{
+            "index": 0,
+            "id": "call_123",
+            "type": "function",
+            "function": {"name": "bookkeeper", "arguments": "A"},
+        }]),
+        delta(tool_calls=[{
+            "index": 0,
+            "id": "call_123",
+            "type": "function",
+            "function": {"name": "bookkeeper", "arguments": "B"},
+        }]),
+        "data: [DONE]",
+    ])
+
+    segments = await collect(adapter(mock_transport), sample_request())
+
+    tool_call = next(segment for segment in segments if segment.kind == "tool_call")
+    assert (tool_call.text, tool_call.tool_call_id, tool_call.tool_type, tool_call.tool_name) == (
+        "AB",
+        "call_123",
+        "function",
+        "bookkeeper",
+    )

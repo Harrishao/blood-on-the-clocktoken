@@ -1073,3 +1073,51 @@ async def test_private_scene_context_excludes_public_and_other_chat_events(tmp_p
 
     prompt = json.loads(adapter.requests[0].messages[1]["content"])
     assert [event["payload"].get("chat_id") for event in prompt["events"]] == ["chat-a"]
+
+
+async def test_private_scene_context_events_require_the_current_chat_id(tmp_path):
+    """The in-memory transcript is authorization filtered like the stream, including chat identity."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "speak_private",
+                {"chat_id": "chat-current", "text": "reply"},
+                call_id="private-context-1",
+            ),
+        )
+    )
+    agent, game_state, _history, _resolver = build_agent(tmp_path, adapter)
+    game_state.phase = "day.private"
+    participants = {"alice", "bob"}
+    old_chat = EventRecord(
+        phase="day.private",
+        type="chat.private_message",
+        audience=Audience.players(participants),
+        payload={"chat_id": "chat-old", "text": "old secret"},
+    )
+    wrong_audience = EventRecord(
+        phase="day.private",
+        type="chat.private_message",
+        audience=Audience.players({"alice", "carol"}),
+        payload={"chat_id": "chat-current", "text": "other secret"},
+    )
+    current_chat = EventRecord(
+        phase="day.private",
+        type="chat.private_message",
+        audience=Audience.players(participants),
+        payload={"chat_id": "chat-current", "text": "current secret"},
+    )
+
+    await agent.run_action(
+        AgentScene(
+            phase="day.private",
+            allowed_tools=("speak_private", "leave_private_chat", "update_notebook", "yield_action"),
+            private_context_only=True,
+            context_events=(old_chat, wrong_audience, current_chat),
+            details={"chat_id": "chat-current", "participants": ["alice", "bob"]},
+        )
+    )
+
+    prompt = json.loads(adapter.requests[0].messages[1]["content"])
+    assert [event["payload"]["text"] for event in prompt["events"]] == ["current secret"]

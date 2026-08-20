@@ -49,6 +49,7 @@ class AgentScene(BaseModel):
     required: bool = False
     allowed_tools: tuple[str, ...] | None = None
     private_context_only: bool = False
+    context_events: tuple[EventRecord, ...] = ()
     details: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -229,6 +230,8 @@ class PlayerAgent:
                     round_scene.allowed_tools,
                     private_context_only=round_scene.private_context_only,
                     participants=round_scene.details.get("participants"),
+                    chat_id=round_scene.details.get("chat_id"),
+                    context_events=round_scene.context_events,
                 )
                 context = self._apply_scene_tool_policy(context, round_scene)
                 messages = [
@@ -486,6 +489,8 @@ class PlayerAgent:
         *,
         private_context_only: bool = False,
         participants: object = None,
+        chat_id: object = None,
+        context_events: Sequence[EventRecord] = (),
     ) -> tuple[PlayerContext, tuple[EventRecord, ...]]:
         source_events = tuple(self._event_source())
         new_events = tuple(
@@ -493,6 +498,7 @@ class PlayerAgent:
             for event in source_events
             if event.seq == 0 or event.seq > self.state.event_cursor
         )
+        candidate_events = (*new_events, *context_events)
         if private_context_only:
             participant_ids = (
                 frozenset(participants)
@@ -501,14 +507,19 @@ class PlayerAgent:
                 and all(isinstance(player_id, str) for player_id in participants)
                 else frozenset()
             )
-            new_events = tuple(
-                event
-                for event in new_events
-                if event.audience.kind == "players"
-                and event.audience.player_ids == participant_ids
-            )
+            if not isinstance(chat_id, str):
+                candidate_events = ()
+            else:
+                candidate_events = tuple(
+                    event
+                    for event in candidate_events
+                    if event.type == "chat.private_message"
+                    and event.audience.kind == "players"
+                    and event.audience.player_ids == participant_ids
+                    and event.payload.get("chat_id") == chat_id
+                )
         projected_state = game_state.model_copy(update={"phase": phase}, deep=True)
-        context = project_context(self.player_id, projected_state, new_events)
+        context = project_context(self.player_id, projected_state, candidate_events)
         if allowed_tools is not None:
             allowed = frozenset(allowed_tools)
             context = context.model_copy(
@@ -648,6 +659,8 @@ class PlayerAgent:
                     live_scene.allowed_tools,
                     private_context_only=live_scene.private_context_only,
                     participants=live_scene.details.get("participants"),
+                    chat_id=live_scene.details.get("chat_id"),
+                    context_events=live_scene.context_events,
                 )
                 live_context = self._apply_scene_tool_policy(
                     live_context,

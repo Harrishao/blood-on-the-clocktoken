@@ -4,9 +4,10 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from clocktower.agents.player import AgentOutcome, ReactionProbe
-from clocktower.domain.actions import LeavePrivateChat, SpeakPrivate, SpeakPublic, YieldAction
+from clocktower.agents.player import AgentOutcome, PrivateInvitationResponse, ReactionProbe
+from clocktower.domain.actions import LeavePrivateChat, SpeakPrivate, SpeakPublic, UpdateNotebook, YieldAction
 from clocktower.domain.events import Audience, EventRecord
+from clocktower.domain.state import Notebook
 from clocktower.history import HistoryWriteError
 from clocktower.models.protocol import ModelCallError
 from clocktower.scheduler.private_chat import PrivateChatScheduler
@@ -26,12 +27,22 @@ class ScriptedPrivateAgent:
 
     async def respond_private_invitation(self, invitation: EventRecord):
         self.invitations.append(invitation)
+        if isinstance(self.invitation, list):
+            result = self.invitation.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         if isinstance(self.invitation, Exception):
             raise self.invitation
         return self.invitation
 
     async def probe(self, event: EventRecord):
         self.probes.append(event)
+        if isinstance(self.probe_result, list):
+            result = self.probe_result.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         if isinstance(self.probe_result, Exception):
             raise self.probe_result
         return self.probe_result
@@ -123,6 +134,9 @@ async def test_request_rejects_invalid_players_night_and_an_existing_scene():
     state.phase = "night"
     with pytest.raises(ValueError, match="day"):
         await scheduler.request("alice", "bob")
+    state.phase = "day.nomination_response"
+    with pytest.raises(ValueError, match="day.discussion"):
+        await scheduler.request("alice", "bob")
     state.phase = "day.discussion"
     state.active_scene = "other-chat"
     with pytest.raises(ValueError, match="active"):
@@ -189,6 +203,7 @@ async def test_private_chat_ends_after_both_players_have_no_new_information():
 
     assert scheduler.end_reason == "quiet"
     assert state.active_scene is None
+    assert not agents["alice"].scenes and not agents["bob"].scenes
 
 
 async def test_leave_stop_and_model_failure_end_and_clear_the_active_scene():
@@ -242,3 +257,240 @@ async def test_history_write_failure_from_private_calls_is_not_swallowed():
 
     with pytest.raises(HistoryWriteError, match="disk failed"):
         await scheduler.request("alice", "bob")
+
+
+async def test_private_transcript_reaches_the_other_participant_without_pretending_it_was_persisted():
+    """The second participant needs the first message now, before Task 11 owns EventStream publication."""
+
+    scheduler, _state, agents = make_scheduler(action_budget=2)
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+    chat_id = result.scene.chat_id
+    agents["alice"].probe_result = ReactionProbe(decision="respond", urgency=15, action_type="speak")
+    agents["bob"].probe_result = ReactionProbe(decision="respond", urgency=-15, action_type="speak")
+    agents["alice"].actions = [SpeakPrivate(actor="alice", chat_id=chat_id, text="first secret")]
+    agents["bob"].actions = [SpeakPrivate(actor="bob", chat_id=chat_id, text="second secret")]
+
+    events = await scheduler.run(chat_id)
+
+    assert [event.payload["text"] for event in events if event.type == "chat.private_message"] == [
+        "first secret",
+        "second secret",
+    ]
+    bob_scene = agents["bob"].scenes[0]
+    assert [event.payload["text"] for event in bob_scene.context_events] == ["first secret"]
+    assert agents["bob"].probes[-1].payload["text"] == "first secret"
+    assert all(event.seq == 0 for event in bob_scene.context_events)
+
+
+async def test_request_revalidates_ownership_after_invitee_await_before_accepting():
+    """A response cannot overwrite a scene or phase that changed while its model call awaited."""
+
+    scheduler, state, agents = make_scheduler()
+
+    class ChangesStateAfterAccept(ScriptedPrivateAgent):
+        async def respond_private_invitation(self, invitation):
+            state.active_scene = "external-scene"
+            state.phase = "night"
+            return "accept"
+
+    agents["bob"] = ChangesStateAfterAccept()
+    scheduler.agents = agents
+    result = await scheduler.request("alice", "bob")
+
+    assert result.decision == "defer"
+    assert result.scene is None
+    assert state.active_scene == "external-scene"
+    assert state.phase == "night"
+
+
+async def test_private_cleanup_does_not_restore_a_phase_or_scene_taken_over_externally():
+    """A stale finally block must not undo Task 11's phase or scene transition."""
+
+    scheduler, state, agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+
+    class TakesOverState(ScriptedPrivateAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            state.phase = "night"
+            state.active_scene = "external-scene"
+            state.stopped = True
+            return AgentOutcome(action=YieldAction(actor="alice", reason="external"), round_trips=1)
+
+    agents["alice"] = TakesOverState()
+    scheduler.agents = agents
+    await scheduler.run(result.scene.chat_id)
+
+    assert state.phase == "night"
+    assert state.active_scene == "external-scene"
+
+
+async def test_run_refuses_to_reclaim_a_private_scene_after_an_external_phase_change():
+    """Starting a stale scene must not overwrite a night transition just because its id still remains."""
+
+    scheduler, state, _agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+    state.phase = "night"
+
+    with pytest.raises(ValueError, match="phase"):
+        await scheduler.run(result.scene.chat_id)
+
+    assert state.phase == "night"
+    assert state.active_scene == result.scene.chat_id
+
+
+async def test_one_participant_yield_cannot_quiet_the_other_before_their_turn():
+    """Quiet is per participant, so Alice yielding leaves Bob a real normal-action opportunity."""
+
+    scheduler, _state, agents = make_scheduler(action_budget=1)
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+    chat_id = result.scene.chat_id
+    agents["alice"].probe_result = ReactionProbe(decision="respond", urgency=15, action_type="speak")
+    agents["bob"].probe_result = ReactionProbe(decision="respond", urgency=-15, action_type="speak")
+    agents["alice"].actions = [YieldAction(actor="alice", reason="no news")]
+    agents["bob"].actions = [SpeakPrivate(actor="bob", chat_id=chat_id, text="Bob still speaks")]
+
+    await scheduler.run(chat_id)
+
+    assert len(agents["bob"].scenes) == 1
+    assert scheduler.end_reason == "action_budget"
+
+
+@pytest.mark.parametrize(
+    "forged_action",
+    [
+        YieldAction(actor="bob", reason="forged yield"),
+        # update_notebook normally remains internal to PlayerAgent; an outward instance is rejected.
+        UpdateNotebook(actor="bob", notebook=Notebook(notes="forged")),
+    ],
+)
+async def test_every_outward_private_action_is_bound_to_the_selected_actor(forged_action):
+    """Yield and notebook action types cannot bypass the selected-player identity check."""
+
+    scheduler, _state, agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+    agents["alice"].probe_result = ReactionProbe(decision="respond", urgency=15, action_type="speak")
+    agents["bob"].probe_result = ReactionProbe(decision="defer", urgency=-15, action_type="yield")
+    agents["alice"].actions = [forged_action]
+    agents["bob"].actions = [LeavePrivateChat(actor="bob", chat_id=result.scene.chat_id)]
+
+    events = await scheduler.run(result.scene.chat_id)
+
+    rejected = [event for event in events if event.type == "scheduler.action_rejected"]
+    assert rejected and rejected[0].payload["reason"] == "wrong_actor"
+
+
+async def test_private_scores_keep_two_actions_per_player_reachable_before_global_cap():
+    """Private cooldown is bounded: four actions can schedule two turns for each participant."""
+
+    scheduler, _state, agents = make_scheduler(action_budget=4, per_player_action_limit=2)
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+
+    class AlwaysSpeak(ScriptedPrivateAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            return AgentOutcome(
+                action=SpeakPrivate(
+                    actor=self.player_id,
+                    chat_id=scene.details["chat_id"],
+                    text=f"{self.player_id} turn {len(self.scenes)}",
+                ),
+                round_trips=1,
+            )
+
+    for player_id in ("alice", "bob"):
+        agent = AlwaysSpeak()
+        agent.player_id = player_id
+        agents[player_id] = agent
+    scheduler.agents = agents
+
+    events = await scheduler.run(result.scene.chat_id)
+
+    messages = [event for event in events if event.type == "chat.private_message"]
+    assert len(messages) == 4
+    assert [event.actor for event in messages].count("alice") == 2
+    assert [event.actor for event in messages].count("bob") == 2
+    assert scheduler.end_reason == "action_budget"
+
+
+async def test_stop_during_probe_fallback_prevents_the_retry_and_later_player_probe():
+    """A stop observed after a fallback is a safe boundary, not permission for one more short call."""
+
+    scheduler, state, agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+
+    class StopOnFallback(ScriptedPrivateAgent):
+        async def probe(self, event):
+            self.probes.append(event)
+            state.stopped = True
+            return ReactionProbe.fallback_silent()
+
+    agents["alice"] = StopOnFallback()
+    scheduler.agents = agents
+
+    await scheduler.run(result.scene.chat_id)
+
+    assert len(agents["alice"].probes) == 1
+    assert not agents["bob"].probes
+    assert scheduler.end_reason == "stopped"
+
+
+async def test_invitation_parser_fallback_retries_once_before_accepting():
+    """A malformed invitation response receives one short retry, without using a normal action call."""
+
+    scheduler, state, agents = make_scheduler()
+    agents["bob"].invitation = [PrivateInvitationResponse.fallback_defer(), "accept"]
+
+    result = await scheduler.request("alice", "bob")
+
+    assert result.decision == "accept"
+    assert result.scene is not None
+    assert len(agents["bob"].invitations) == 2
+    assert state.active_scene == result.scene.chat_id
+
+
+async def test_private_probe_parser_fallback_retries_once_before_its_adjustment_is_used():
+    """Private probes retain Task 9's bounded parser retry without giving a fallback silent weight."""
+
+    scheduler, _state, agents = make_scheduler(action_budget=1)
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+    agents["alice"].probe_result = [
+        ReactionProbe.fallback_silent(),
+        ReactionProbe(decision="respond", urgency=4, action_type="speak"),
+    ]
+    agents["alice"].actions = [SpeakPrivate(actor="alice", chat_id=result.scene.chat_id, text="retry")]
+
+    await scheduler.run(result.scene.chat_id)
+
+    assert len(agents["alice"].probes) == 2
+    assert scheduler.probe_adjustments["alice"] == 4
+
+
+async def test_stop_after_first_normal_model_failure_prevents_private_retry():
+    """A normal retry may not begin after the failed first call has observed stop."""
+
+    scheduler, state, agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+
+    class StopOnNormalFailure(ScriptedPrivateAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            state.stopped = True
+            raise ModelCallError("provider unavailable")
+
+    agents["alice"] = StopOnNormalFailure()
+    scheduler.agents = agents
+
+    await scheduler.run(result.scene.chat_id)
+
+    assert len(agents["alice"].scenes) == 1
+    assert scheduler.end_reason == "stopped"

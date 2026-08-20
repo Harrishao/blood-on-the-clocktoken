@@ -48,6 +48,16 @@ class DisconnectProbe:
         return self.disconnected
 
 
+class FutureCursorGuardStream(EventStream):
+    def __init__(self) -> None:
+        super().__init__()
+        self.wait_calls = 0
+
+    async def wait_for_after(self, seq: int) -> tuple[EventRecord, ...]:
+        self.wait_calls += 1
+        raise RuntimeError(f"future cursor entered waiter: {seq}")
+
+
 def event(number: int) -> EventRecord:
     return EventRecord(
         phase="day.discussion",
@@ -120,6 +130,21 @@ def test_event_endpoint_rejects_invalid_after_seq(cursor: str) -> None:
     app = create_api_app(ControllableOrchestrator(runtime_state="ended"), EventStream())
     with TestClient(app) as client:
         assert client.get(f"/api/events?after_seq={cursor}").status_code == 422
+
+
+@pytest.mark.parametrize("runtime_state", ["running", "ended"])
+def test_event_endpoint_rejects_future_cursor_without_starting_waiter(
+    runtime_state: str,
+) -> None:
+    stream = FutureCursorGuardStream()
+    app = create_api_app(ControllableOrchestrator(runtime_state=runtime_state), stream)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/api/events?after_seq=1")
+
+    assert response.status_code == 422
+    assert response.json() == {"detail": "after_seq exceeds current event sequence"}
+    assert stream.wait_calls == 0
 
 
 async def test_sse_replays_then_waits_for_live_persisted_records() -> None:

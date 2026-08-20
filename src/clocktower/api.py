@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Callable
 from typing import Annotated, Any, Protocol
 
-from fastapi import APIRouter, FastAPI, Query, Request
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
 from clocktower.event_stream import EventStream
@@ -62,6 +62,11 @@ async def events(
 ) -> StreamingResponse:
     orchestrator: RuntimeController = request.app.state.orchestrator
     stream: EventStream = request.app.state.stream
+    if after_seq > stream.next_seq - 1:
+        raise HTTPException(
+            status_code=422,
+            detail="after_seq exceeds current event sequence",
+        )
     return StreamingResponse(
         sse_events(
             request,

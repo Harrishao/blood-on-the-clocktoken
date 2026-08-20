@@ -529,13 +529,25 @@ class PlayerAgent:
 
     @staticmethod
     def _deduplicate_events(events: Sequence[EventRecord]) -> tuple[EventRecord, ...]:
+        committed_identities = {
+            event.model_dump_json(exclude={"seq"})
+            for event in events
+            if event.seq > 0
+        }
         unique: list[EventRecord] = []
-        seen: set[str] = set()
+        seen_committed_sequences: set[int] = set()
+        seen_drafts: set[str] = set()
         for event in events:
-            identity = event.model_dump_json(exclude={"seq"})
-            if identity in seen:
+            if event.seq > 0:
+                if event.seq in seen_committed_sequences:
+                    continue
+                seen_committed_sequences.add(event.seq)
+                unique.append(event)
                 continue
-            seen.add(identity)
+            identity = event.model_dump_json(exclude={"seq"})
+            if identity in committed_identities or identity in seen_drafts:
+                continue
+            seen_drafts.add(identity)
             unique.append(event)
         return tuple(unique)
 

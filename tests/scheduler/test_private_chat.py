@@ -250,6 +250,230 @@ async def test_committed_private_message_replaces_seq_zero_transcript_draft():
     assert bob_scene.context_events == tuple(request.scene.transcript)
 
 
+async def test_private_action_sink_failure_retries_exact_batch_without_replaying_model():
+    """A prepared secret message remains pending until durable and finalizes its counters once."""
+
+    next_seq = 400
+    failed_batch: tuple[EventRecord, ...] | None = None
+    action_sink_attempts: list[tuple[EventRecord, ...]] = []
+
+    async def event_sink(events):
+        nonlocal next_seq, failed_batch
+        batch = tuple(events)
+        if any(event.type == "chat.private_message" for event in batch):
+            action_sink_attempts.append(batch)
+            if failed_batch is None:
+                failed_batch = batch
+                raise HistoryWriteError("private action batch not durable")
+        committed = tuple(
+            event.model_copy(update={"seq": next_seq + index})
+            for index, event in enumerate(batch)
+        )
+        next_seq += len(committed)
+        return committed
+
+    scheduler, state, agents = make_scheduler(
+        action_budget=1,
+        event_sink=event_sink,
+    )
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    chat_id = request.scene.chat_id
+    for player_id in ("alice", "bob"):
+        agents[player_id].actions = [
+            SpeakPrivate(actor=player_id, chat_id=chat_id, text=f"{player_id} once")
+        ]
+
+    with pytest.raises(HistoryWriteError, match="private action batch not durable"):
+        await scheduler.run(chat_id)
+
+    assert sum(len(agent.scenes) for agent in agents.values()) == 1
+    assert request.scene.action_count == 0
+    assert request.scene.transcript == []
+    assert scheduler.end_reason is None
+    assert state.active_scene == chat_id
+    assert request.scene.pending_action_commit is not None
+    assert isinstance(request.scene.pending_action_commit.action, SpeakPrivate)
+
+    recovered = await scheduler.run(chat_id)
+
+    assert sum(len(agent.scenes) for agent in agents.values()) == 1
+    assert len(action_sink_attempts) == 2
+    assert action_sink_attempts[1] == failed_batch
+    assert request.scene.action_count == 1
+    assert len(request.scene.transcript) == 1
+    assert request.scene.transcript[0].seq > 0
+    assert sum(event.type == "chat.private_message" for event in recovered) == 1
+    assert scheduler.end_reason == "action_budget"
+
+
+async def test_stopped_reentry_leaves_failed_private_action_pending_without_new_facts():
+    """Calling the scheduler while stopped cannot discard or publish its pending action checkpoint."""
+
+    action_attempts = 0
+
+    async def event_sink(events):
+        nonlocal action_attempts
+        if any(event.type == "chat.private_message" for event in events):
+            action_attempts += 1
+            if action_attempts == 1:
+                raise HistoryWriteError("private checkpoint unavailable")
+        return tuple(events)
+
+    scheduler, state, agents = make_scheduler(action_budget=1, event_sink=event_sink)
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    chat_id = request.scene.chat_id
+    for player_id in ("alice", "bob"):
+        agents[player_id].actions = [
+            SpeakPrivate(actor=player_id, chat_id=chat_id, text=f"{player_id} pending")
+        ]
+
+    with pytest.raises(HistoryWriteError, match="private checkpoint unavailable"):
+        await scheduler.run(chat_id)
+
+    state.stopped = True
+    assert await scheduler.run(chat_id) == []
+    assert action_attempts == 1
+    assert request.scene.action_count == 0
+    assert scheduler.end_reason is None
+    assert state.active_scene == chat_id
+
+    state.stopped = False
+    await scheduler.run(chat_id)
+    assert action_attempts == 2
+    assert sum(len(agent.scenes) for agent in agents.values()) == 1
+
+
+async def test_invitation_history_failure_resumes_same_request_without_replaying_invitation():
+    """An invitee notebook failure retries the response stage under the original request id."""
+
+    emitted: list[EventRecord] = []
+
+    async def event_sink(events):
+        committed = tuple(
+            event.model_copy(update={"seq": len(emitted) + index + 1})
+            for index, event in enumerate(events)
+        )
+        emitted.extend(committed)
+        return committed
+
+    scheduler, state, agents = make_scheduler(event_sink=event_sink)
+    agents["bob"].invitation = [HistoryWriteError("invite response not durable"), "accept"]
+
+    with pytest.raises(HistoryWriteError, match="invite response not durable"):
+        await scheduler.request("alice", "bob")
+
+    first_invitation = next(event for event in emitted if event.type == "chat.private_invitation")
+    assert state.active_scene is None
+
+    recovered = await scheduler.request("alice", "bob")
+
+    assert recovered.request_id == first_invitation.payload["request_id"]
+    assert recovered.decision == "accept"
+    assert recovered.scene is not None
+    assert len(agents["bob"].invitations) == 2
+    assert sum(event.type == "chat.private_invitation" for event in emitted) == 1
+    assert sum(event.type == "chat.private_response" for event in emitted) == 1
+
+
+async def test_selection_sink_failure_resumes_same_selection_without_replaying_prefix():
+    """Selection persistence retries its exact fact before the selected normal model starts."""
+
+    emitted: list[EventRecord] = []
+    selection_attempts: list[tuple[EventRecord, ...]] = []
+    failed_once = False
+
+    async def event_sink(events):
+        nonlocal failed_once
+        batch = tuple(events)
+        if any(event.type == "scheduler.selection" for event in batch):
+            selection_attempts.append(batch)
+            if not failed_once:
+                failed_once = True
+                raise HistoryWriteError("selection not durable")
+        emitted.extend(batch)
+        return batch
+
+    scheduler, _state, agents = make_scheduler(action_budget=1, event_sink=event_sink)
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    chat_id = request.scene.chat_id
+    for player_id in ("alice", "bob"):
+        agents[player_id].actions = [
+            SpeakPrivate(actor=player_id, chat_id=chat_id, text=f"{player_id} selected")
+        ]
+
+    with pytest.raises(HistoryWriteError, match="selection not durable"):
+        await scheduler.run(chat_id)
+
+    assert sum(len(agent.probes) for agent in agents.values()) == 2
+    assert all(not agent.scenes for agent in agents.values())
+
+    await scheduler.run(chat_id)
+
+    assert len(selection_attempts) == 2
+    assert selection_attempts[1] == selection_attempts[0]
+    assert sum(event.type == "scheduler.ranking" for event in emitted) == 1
+    assert sum(event.type == "scheduler.probe_adjustment" for event in emitted) == 2
+    assert sum(len(agent.probes) for agent in agents.values()) == 2
+    assert sum(len(agent.scenes) for agent in agents.values()) == 1
+
+
+async def test_cancel_after_selection_commit_resumes_selected_normal_without_replaying_prefix():
+    """The in-memory selection cursor advances before awaiting its cancellable safe point."""
+
+    emitted: list[EventRecord] = []
+    selection_safe_started = asyncio.Event()
+    block_selection_safe = False
+    blocked_once = False
+
+    async def event_sink(events):
+        nonlocal block_selection_safe
+        batch = tuple(events)
+        emitted.extend(batch)
+        if any(event.type == "scheduler.selection" for event in batch):
+            block_selection_safe = True
+        return batch
+
+    async def safe_point():
+        nonlocal blocked_once
+        if block_selection_safe and not blocked_once:
+            blocked_once = True
+            selection_safe_started.set()
+            await asyncio.Event().wait()
+
+    scheduler, state, agents = make_scheduler(
+        action_budget=1,
+        event_sink=event_sink,
+        safe_point=safe_point,
+    )
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    chat_id = request.scene.chat_id
+    for player_id in ("alice", "bob"):
+        agents[player_id].actions = [
+            SpeakPrivate(actor=player_id, chat_id=chat_id, text=f"{player_id} after cancel")
+        ]
+
+    task = asyncio.create_task(scheduler.run(chat_id))
+    await asyncio.wait_for(selection_safe_started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert state.active_scene == chat_id
+    assert all(not agent.scenes for agent in agents.values())
+
+    await scheduler.run(chat_id)
+
+    assert sum(event.type == "scheduler.ranking" for event in emitted) == 1
+    assert sum(event.type == "scheduler.probe_adjustment" for event in emitted) == 2
+    assert sum(event.type == "scheduler.selection" for event in emitted) == 1
+    assert sum(len(agent.probes) for agent in agents.values()) == 2
+    assert sum(len(agent.scenes) for agent in agents.values()) == 1
+
+
 async def test_stop_arriving_during_invitation_sink_prevents_invitee_model_call():
     """The private invitation must be durable before consent inference is allowed to start."""
 

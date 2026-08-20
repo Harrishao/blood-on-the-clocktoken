@@ -16,6 +16,21 @@ from clocktower.models.protocol import ModelCallError
 from .scoring import CandidateScore, FeatureContribution, choose_candidate
 
 
+@dataclass(frozen=True)
+class _PendingPrivateActionCommit:
+    """One completed private model action awaiting durable publication."""
+
+    events: tuple[EventRecord, ...]
+    player_id: str
+    action_count_after: int
+    action_counts_after: dict[str, int]
+    quiet_count_after: int
+    quiet_player_ids_after: frozenset[str]
+    last_speaker_after: str | None
+    end_reason_after: str | None
+    action: object | None = None
+
+
 @dataclass
 class PrivateChatScene:
     """The sole active private subscene; participant order is invitation order."""
@@ -33,6 +48,22 @@ class PrivateChatScene:
     pending_scores: tuple[CandidateScore, ...] = ()
     pending_probe_index: int = 0
     pending_probe_adjustments: dict[str, int] = field(default_factory=dict)
+    pending_selection_event: EventRecord | None = None
+    pending_action_commit: _PendingPrivateActionCommit | None = None
+
+
+@dataclass
+class _PendingPrivateRequest:
+    request_number: int
+    request_id: str
+    inviter: str
+    invitee: str
+    invitation_draft: EventRecord
+    invitation: EventRecord | None = None
+    decision: str | None = None
+    response_draft: EventRecord | None = None
+    response: EventRecord | None = None
+    scene: PrivateChatScene | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +105,7 @@ class PrivateChatScheduler:
         self._safe_point = safe_point
         self._scene: PrivateChatScene | None = None
         self._request_number = 0
+        self._pending_request: _PendingPrivateRequest | None = None
         self._selection_number = 0
         self._lock = asyncio.Lock()
         self.end_reason: str | None = None
@@ -85,69 +117,98 @@ class PrivateChatScheduler:
 
         async with self._lock:
             state = self._state_provider()
-            self._validate_request(state, inviter, invitee)
-            self._request_number += 1
-            request_id = f"private-request-{state.seed}-{self._request_number}"
-            invitation = (await self._emit((EventRecord(
-                phase="day.private_invite",
-                type="chat.private_invitation",
-                actor=inviter,
-                audience=Audience.player(invitee),
-                payload={"request_id": request_id, "inviter": inviter},
-            ),)))[0]
+            pending = self._pending_request
+            if pending is None:
+                self._validate_request(state, inviter, invitee)
+                self._request_number += 1
+                request_id = f"private-request-{state.seed}-{self._request_number}"
+                pending = _PendingPrivateRequest(
+                    request_number=self._request_number,
+                    request_id=request_id,
+                    inviter=inviter,
+                    invitee=invitee,
+                    invitation_draft=EventRecord(
+                        phase="day.private_invite",
+                        type="chat.private_invitation",
+                        actor=inviter,
+                        audience=Audience.player(invitee),
+                        payload={"request_id": request_id, "inviter": inviter},
+                    ),
+                )
+                self._pending_request = pending
+            elif (pending.inviter, pending.invitee) != (inviter, invitee):
+                raise ValueError("another private-chat request is awaiting recovery")
+
+            if pending.invitation is None:
+                pending.invitation = (await self._emit((pending.invitation_draft,)))[0]
             await self._at_safe_point()
             if self._state_provider().stopped:
+                self._pending_request = None
                 return PrivateChatRequest(
-                    request_id=request_id,
+                    request_id=pending.request_id,
                     decision="defer",
                     scene=None,
-                    events=(invitation,),
-                )
-            decision = await self._request_decision(invitee, invitation)
-            if decision == "accept" and not self._can_accept_after_wait(inviter, invitee):
-                decision = "defer"
-            response = (await self._emit((EventRecord(
-                phase="day.private_invite",
-                type="chat.private_response",
-                actor=invitee,
-                audience=Audience.player(invitee),
-                payload={"request_id": request_id, "decision": decision},
-            ),)))[0]
-            await self._at_safe_point()
-            if decision != "accept":
-                return PrivateChatRequest(
-                    request_id=request_id,
-                    decision=decision,
-                    scene=None,
-                    events=(invitation, response),
-                )
-            if self._state_provider().stopped:
-                return PrivateChatRequest(
-                    request_id=request_id,
-                    decision="defer",
-                    scene=None,
-                    events=(invitation, response),
+                    events=(pending.invitation,),
                 )
 
-            accepted_state = self._state_provider()
-            chat_id = f"private-chat-{accepted_state.seed}-{self._request_number}"
-            scene = PrivateChatScene(
-                chat_id=chat_id,
-                participant_ids=(inviter, invitee),
-                parent_phase=accepted_state.phase,
-            )
-            self._scene = scene
-            accepted_state.active_scene = chat_id
-            self.end_reason = None
-            self.probed_player_ids = ()
-            self.probe_adjustments = {}
+            if pending.decision is None:
+                decision = await self._request_decision(pending.invitee, pending.invitation)
+                if decision == "accept" and not self._can_accept_after_wait(inviter, invitee):
+                    decision = "defer"
+                pending.decision = decision
+                pending.response_draft = EventRecord(
+                    phase="day.private_invite",
+                    type="chat.private_response",
+                    actor=invitee,
+                    audience=Audience.player(invitee),
+                    payload={"request_id": pending.request_id, "decision": decision},
+                )
+            if pending.response is None:
+                if pending.response_draft is None:
+                    raise RuntimeError("private response stage has no event")
+                pending.response = (await self._emit((pending.response_draft,)))[0]
             await self._at_safe_point()
-            return PrivateChatRequest(
-                request_id=request_id,
-                decision=decision,
-                scene=scene,
-                events=(invitation, response),
+            if pending.decision != "accept":
+                result = PrivateChatRequest(
+                    request_id=pending.request_id,
+                    decision=pending.decision,
+                    scene=None,
+                    events=(pending.invitation, pending.response),
+                )
+                self._pending_request = None
+                return result
+            if self._state_provider().stopped:
+                result = PrivateChatRequest(
+                    request_id=pending.request_id,
+                    decision="defer",
+                    scene=None,
+                    events=(pending.invitation, pending.response),
+                )
+                self._pending_request = None
+                return result
+
+            if pending.scene is None:
+                accepted_state = self._state_provider()
+                chat_id = f"private-chat-{accepted_state.seed}-{pending.request_number}"
+                pending.scene = PrivateChatScene(
+                    chat_id=chat_id,
+                    participant_ids=(inviter, invitee),
+                    parent_phase=accepted_state.phase,
+                )
+                self._scene = pending.scene
+                accepted_state.active_scene = chat_id
+                self.end_reason = None
+                self.probed_player_ids = ()
+                self.probe_adjustments = {}
+            await self._at_safe_point()
+            result = PrivateChatRequest(
+                request_id=pending.request_id,
+                decision=pending.decision,
+                scene=pending.scene,
+                events=(pending.invitation, pending.response),
             )
+            self._pending_request = None
+            return result
 
     async def run(self, chat_id: str) -> list[EventRecord]:
         """Run the accepted subscene to one of its bounded termination conditions."""
@@ -179,6 +240,13 @@ class PrivateChatScheduler:
                     self._end(scene, "ownership_lost")
                     break
                 if current_state.stopped:
+                    if (
+                        scene.pending_action_commit is not None
+                        or scene.pending_selection_event is not None
+                        or scene.pending_player_id is not None
+                        or scene.pending_scores
+                    ):
+                        return events
                     stopped = self._observer_event("scheduler.stopped", scene)
                     events.extend(await self._emit((stopped,)))
                     self._end(scene, "stopped")
@@ -187,13 +255,29 @@ class PrivateChatScheduler:
                     self._end(scene, "action_budget")
                     break
 
+                if scene.pending_selection_event is not None:
+                    committed_selection = await self._emit((scene.pending_selection_event,))
+                    events.extend(committed_selection)
+                    scene.pending_selection_event = None
+                    await self._at_safe_point()
+                    if self._state_provider().stopped:
+                        stopped = self._observer_event("scheduler.stopped", scene)
+                        events.extend(await self._emit((stopped,)))
+                        self._end(scene, "stopped")
+                        break
+                    continue
+
                 if scene.pending_player_id is not None:
-                    selected = scene.pending_player_id
-                    action_events = await self._run_one_action(scene, selected)
-                    committed_action = await self._emit(action_events)
+                    if scene.pending_action_commit is None:
+                        scene.pending_action_commit = await self._prepare_one_action(
+                            scene,
+                            scene.pending_player_id,
+                        )
+                    if scene.pending_action_commit is None:
+                        continue
+                    committed_action = await self._emit(scene.pending_action_commit.events)
                     events.extend(committed_action)
-                    self._append_committed_transcript(scene, committed_action)
-                    scene.pending_player_id = None
+                    self._finalize_pending_action(scene, committed_action)
                     await self._at_safe_point()
                     continue
 
@@ -233,14 +317,8 @@ class PrivateChatScheduler:
                     await self._at_safe_point()
                     continue
                 selection = self._selection_event(scene, selected)
-                events.extend(await self._emit((selection,)))
-                await self._at_safe_point()
-                if self._state_provider().stopped:
-                    stopped = self._observer_event("scheduler.stopped", scene)
-                    events.extend(await self._emit((stopped,)))
-                    self._end(scene, "stopped")
-                    break
                 scene.pending_player_id = selected
+                scene.pending_selection_event = selection
 
             ended = self._public_shell("chat.private_ended", scene)
             events.extend(await self._emit((ended,)))
@@ -428,11 +506,18 @@ class PrivateChatScheduler:
             scene.pending_probe_adjustments = {}
         return adjusted, events
 
-    async def _run_one_action(self, scene: PrivateChatScene, player_id: str) -> list[EventRecord]:
+    async def _prepare_one_action(
+        self,
+        scene: PrivateChatScene,
+        player_id: str,
+    ) -> _PendingPrivateActionCommit | None:
         agent = self.agents.get(player_id)
         if agent is None:
-            self._mark_quiet(scene, player_id)
-            return [self._observer_event("scheduler.action_rejected", scene, {"player_id": player_id, "reason": "missing_agent"}), *self._quiet_events(scene, [])]
+            return self._prepare_quiet_action(
+                scene,
+                player_id,
+                (self._observer_event("scheduler.action_rejected", scene, {"player_id": player_id, "reason": "missing_agent"}),),
+            )
         agent_scene = AgentScene(
             phase="day.private",
             purpose="private_chat",
@@ -443,101 +528,210 @@ class PrivateChatScheduler:
         )
         if not self._owns(scene):
             self._end(scene, "ownership_lost")
-            return []
+            return None
         if self._state_provider().stopped:
-            self._end(scene, "stopped")
-            return [self._observer_event("scheduler.stopped", scene)]
+            return self._prepared_private_action(
+                scene,
+                player_id,
+                (self._observer_event("scheduler.stopped", scene),),
+                end_reason="stopped",
+            )
         try:
             outcome = await agent.run_action(agent_scene)
         except ModelCallError:
             if not self._owns(scene):
                 self._end(scene, "ownership_lost")
-                return []
+                return None
             if self._state_provider().stopped:
-                self._end(scene, "stopped")
-                return [self._observer_event("scheduler.stopped", scene)]
+                return self._prepared_private_action(
+                    scene,
+                    player_id,
+                    (self._observer_event("scheduler.stopped", scene),),
+                    end_reason="stopped",
+                )
             await self._at_safe_point()
             if not self._owns(scene):
                 self._end(scene, "ownership_lost")
-                return []
+                return None
             if self._state_provider().stopped:
-                self._end(scene, "stopped")
-                return [self._observer_event("scheduler.stopped", scene)]
+                return self._prepared_private_action(
+                    scene,
+                    player_id,
+                    (self._observer_event("scheduler.stopped", scene),),
+                    end_reason="stopped",
+                )
             try:
                 outcome = await agent.run_action(agent_scene)
             except ModelCallError:
                 if not self._owns(scene):
                     self._end(scene, "ownership_lost")
-                    return []
-                self._mark_quiet(scene, player_id)
-                return [
-                    self._observer_event(
+                    return None
+                return self._prepare_quiet_action(
+                    scene,
+                    player_id,
+                    (self._observer_event(
                         "scheduler.normal_action_failed",
                         scene,
                         {"player_id": player_id, "reason": "yield_after_retry"},
-                    ),
-                    *self._quiet_events(scene, []),
-                ]
+                    ),),
+                )
         if not self._owns(scene):
             self._end(scene, "ownership_lost")
-            return []
-        return self._apply_outcome(scene, player_id, outcome)
+            return None
+        return self._prepare_outcome(scene, player_id, outcome)
 
-    def _apply_outcome(self, scene: PrivateChatScene, player_id: str, outcome: AgentOutcome) -> list[EventRecord]:
+    def _prepare_outcome(
+        self,
+        scene: PrivateChatScene,
+        player_id: str,
+        outcome: AgentOutcome,
+    ) -> _PendingPrivateActionCommit | None:
         if not self._owns(scene):
             self._end(scene, "ownership_lost")
-            return []
+            return None
         if self._state_provider().stopped:
-            self._end(scene, "stopped")
-            return [self._observer_event("scheduler.stopped", scene)]
+            return self._prepared_private_action(
+                scene,
+                player_id,
+                (self._observer_event("scheduler.stopped", scene),),
+                end_reason="stopped",
+            )
         action = outcome.action
         if action is None:
-            self._mark_quiet(scene, player_id)
-            return self._quiet_events(scene, [])
+            return self._prepare_quiet_action(scene, player_id, (), action=action)
         if getattr(action, "actor", None) != player_id:
-            self._mark_quiet(scene, player_id)
-            return [
-                self._observer_event("scheduler.action_rejected", scene, {"player_id": player_id, "reason": "wrong_actor"}),
-                *self._quiet_events(scene, []),
-            ]
+            return self._prepare_quiet_action(
+                scene,
+                player_id,
+                (self._observer_event("scheduler.action_rejected", scene, {"player_id": player_id, "reason": "wrong_actor"}),),
+                action=action,
+            )
         if isinstance(action, UpdateNotebook):
-            self._mark_quiet(scene, player_id)
-            return [
-                self._observer_event("scheduler.action_rejected", scene, {"player_id": player_id, "reason": "outward_notebook"}),
-                *self._quiet_events(scene, []),
-            ]
+            return self._prepare_quiet_action(
+                scene,
+                player_id,
+                (self._observer_event("scheduler.action_rejected", scene, {"player_id": player_id, "reason": "outward_notebook"}),),
+                action=action,
+            )
         if isinstance(action, YieldAction):
-            self._mark_quiet(scene, player_id)
-            return self._quiet_events(scene, [])
+            return self._prepare_quiet_action(scene, player_id, (), action=action)
         if isinstance(action, LeavePrivateChat) and action.actor == player_id and action.chat_id == scene.chat_id:
-            scene.action_count += 1
-            scene.action_counts[player_id] = scene.action_counts.get(player_id, 0) + 1
-            scene.last_speaker = player_id
-            self._end(scene, "left")
-            return [self._observer_event("scheduler.private_left", scene, {"player_id": player_id})]
+            action_counts = dict(scene.action_counts)
+            action_counts[player_id] = action_counts.get(player_id, 0) + 1
+            return self._prepared_private_action(
+                scene,
+                player_id,
+                (self._observer_event("scheduler.private_left", scene, {"player_id": player_id}),),
+                action_count=scene.action_count + 1,
+                action_counts=action_counts,
+                last_speaker=player_id,
+                end_reason="left",
+                action=action,
+            )
         if isinstance(action, SpeakPrivate) and action.actor == player_id and action.chat_id == scene.chat_id:
-            scene.action_count += 1
-            scene.action_counts[player_id] = scene.action_counts.get(player_id, 0) + 1
-            scene.last_speaker = player_id
-            events = [
+            action_count = scene.action_count + 1
+            action_counts = dict(scene.action_counts)
+            action_counts[player_id] = action_counts.get(player_id, 0) + 1
+            return self._prepared_private_action(
+                scene,
+                player_id,
+                (
                 EventRecord(
                     phase="day.private",
                     type="chat.private_message",
                     actor=player_id,
                     audience=Audience.players(set(scene.participant_ids)),
                     payload={"chat_id": scene.chat_id, "text": action.text},
-                )
-            ]
-            scene.quiet_player_ids.clear()
-            scene.quiet_count = 0
-            if scene.action_count >= self.action_budget:
-                self._end(scene, "action_budget")
-            return events
-        self._mark_quiet(scene, player_id)
-        return [
-            self._observer_event("scheduler.action_rejected", scene, {"player_id": player_id, "reason": "non_private_or_wrong_actor"}),
-            *self._quiet_events(scene, []),
-        ]
+                ),
+                ),
+                action_count=action_count,
+                action_counts=action_counts,
+                quiet_count=0,
+                quiet_player_ids=frozenset(),
+                last_speaker=player_id,
+                end_reason="action_budget" if action_count >= self.action_budget else self.end_reason,
+                action=action,
+            )
+        return self._prepare_quiet_action(
+            scene,
+            player_id,
+            (self._observer_event("scheduler.action_rejected", scene, {"player_id": player_id, "reason": "non_private_or_wrong_actor"}),),
+            action=action,
+        )
+
+    def _prepare_quiet_action(
+        self,
+        scene: PrivateChatScene,
+        player_id: str,
+        prefix: Sequence[EventRecord],
+        *,
+        action: object | None = None,
+    ) -> _PendingPrivateActionCommit:
+        quiet_ids = set(scene.quiet_player_ids)
+        quiet_ids.add(player_id)
+        quiet_count = len(quiet_ids)
+        end_reason = "quiet" if set(scene.participant_ids) <= quiet_ids else self.end_reason
+        return self._prepared_private_action(
+            scene,
+            player_id,
+            (*prefix, self._observer_event(
+                "scheduler.quiet_window",
+                scene,
+                {"quiet_count": quiet_count, "eligible_count": 0},
+            )),
+            quiet_count=quiet_count,
+            quiet_player_ids=frozenset(quiet_ids),
+            end_reason=end_reason,
+            action=action,
+        )
+
+    def _prepared_private_action(
+        self,
+        scene: PrivateChatScene,
+        player_id: str,
+        events: Sequence[EventRecord],
+        *,
+        action_count: int | None = None,
+        action_counts: dict[str, int] | None = None,
+        quiet_count: int | None = None,
+        quiet_player_ids: frozenset[str] | None = None,
+        last_speaker: str | None = None,
+        end_reason: str | None = None,
+        action: object | None = None,
+    ) -> _PendingPrivateActionCommit:
+        return _PendingPrivateActionCommit(
+            events=tuple(events),
+            player_id=player_id,
+            action_count_after=scene.action_count if action_count is None else action_count,
+            action_counts_after=dict(scene.action_counts) if action_counts is None else action_counts,
+            quiet_count_after=scene.quiet_count if quiet_count is None else quiet_count,
+            quiet_player_ids_after=(
+                frozenset(scene.quiet_player_ids)
+                if quiet_player_ids is None
+                else quiet_player_ids
+            ),
+            last_speaker_after=scene.last_speaker if last_speaker is None else last_speaker,
+            end_reason_after=end_reason,
+            action=action,
+        )
+
+    def _finalize_pending_action(
+        self,
+        scene: PrivateChatScene,
+        committed: Sequence[EventRecord],
+    ) -> None:
+        pending = scene.pending_action_commit
+        if pending is None:
+            raise RuntimeError("no prepared private action to finalize")
+        scene.action_count = pending.action_count_after
+        scene.action_counts = dict(pending.action_counts_after)
+        scene.quiet_count = pending.quiet_count_after
+        scene.quiet_player_ids = set(pending.quiet_player_ids_after)
+        scene.last_speaker = pending.last_speaker_after
+        self.end_reason = pending.end_reason_after
+        self._append_committed_transcript(scene, committed)
+        scene.pending_action_commit = None
+        scene.pending_player_id = None
 
     def _choose(self, scene: PrivateChatScene, scores: list[CandidateScore]) -> str | None:
         eligible = [

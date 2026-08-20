@@ -1164,3 +1164,45 @@ async def test_private_scene_deduplicates_same_committed_event_from_stream_and_t
     ]
     assert len(matching) == 1
     assert matching[0]["seq"] == committed.seq
+
+
+async def test_private_scene_keeps_distinct_committed_sequences_with_identical_content(tmp_path):
+    """Only a seq-zero draft is shadowed; two durable identical facts remain two facts."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "speak_private",
+                {"chat_id": "chat-current", "text": "reply"},
+                call_id="private-dedup-sequences-1",
+            ),
+        )
+    )
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+    game_state.phase = "day.private"
+    draft = EventRecord(
+        phase="day.private",
+        type="chat.private_message",
+        audience=Audience.players({"alice", "bob"}),
+        payload={"chat_id": "chat-current", "text": "same durable content"},
+    )
+    first = await history.append(draft)
+    second = await history.append(draft)
+
+    await agent.run_action(
+        AgentScene(
+            phase="day.private",
+            allowed_tools=("speak_private", "leave_private_chat", "update_notebook", "yield_action"),
+            private_context_only=True,
+            context_events=(draft, first, second),
+            details={"chat_id": "chat-current", "participants": ["alice", "bob"]},
+        )
+    )
+
+    prompt = json.loads(adapter.requests[0].messages[1]["content"])
+    matching = [
+        event
+        for event in prompt["events"]
+        if event["payload"].get("text") == "same durable content"
+    ]
+    assert [event["seq"] for event in matching] == [first.seq, second.seq]

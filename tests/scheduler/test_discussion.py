@@ -218,6 +218,59 @@ async def test_committed_public_action_becomes_the_next_nonzero_trigger():
     assert all(event.seq > 0 for event in first + second)
 
 
+async def test_public_action_sink_failure_retries_exact_batch_without_replaying_model_or_rules():
+    """A durable-write retry owns the prepared action batch, not a second model/rule opportunity."""
+
+    import pytest
+
+    next_seq = 300
+    failed_batch: tuple[EventRecord, ...] | None = None
+    action_sink_attempts: list[tuple[EventRecord, ...]] = []
+
+    async def event_sink(events):
+        nonlocal next_seq, failed_batch
+        batch = tuple(events)
+        if any(event.type == "player.public_message" for event in batch):
+            action_sink_attempts.append(batch)
+            if failed_batch is None:
+                failed_batch = batch
+                raise HistoryWriteError("public action batch not durable")
+        committed = tuple(
+            event.model_copy(update={"seq": next_seq + index})
+            for index, event in enumerate(batch)
+        )
+        next_seq += len(committed)
+        return committed
+
+    scheduler, agents, rules = make_scheduler(
+        action_budget=1,
+        event_sink=event_sink,
+    )
+
+    with pytest.raises(HistoryWriteError, match="public action batch not durable"):
+        await scheduler.step()
+
+    assert sum(len(agent.scenes) for agent in agents.values()) == 1
+    assert len(rules.actions) == 1
+    assert scheduler.action_count == 0
+    assert scheduler.end_reason is None
+    assert scheduler.pending_action_commit is not None
+    assert isinstance(scheduler.pending_action_commit.action, SpeakPublic)
+
+    recovered = await scheduler.step()
+
+    assert sum(len(agent.scenes) for agent in agents.values()) == 1
+    assert len(rules.actions) == 1
+    assert len(action_sink_attempts) == 2
+    assert action_sink_attempts[1] == failed_batch
+    assert scheduler.action_count == 1
+    assert scheduler.end_reason == "action_budget"
+    assert [event.type for event in recovered] == [
+        "player.public_message",
+        "scheduler.ended",
+    ]
+
+
 async def test_stop_arriving_during_ranking_sink_prevents_any_probe():
     """A committed ranking is a causal boundary before the first short model call."""
 

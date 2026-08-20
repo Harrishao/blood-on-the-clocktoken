@@ -115,7 +115,11 @@ class GameOrchestrator:
         """Idempotently request the next safe scheduling boundary."""
 
         async with self._control_lock:
-            if self._runtime_state in {"stopped", "ended"}:
+            if self._runtime_state == "ended":
+                return
+            if self._runtime_state == "stopped":
+                if self._reason == "history_write_failed":
+                    self._stop_requested = True
                 return
             self._stop_requested = True
 
@@ -539,7 +543,10 @@ class GameOrchestrator:
 
                 provider_failures = 0
                 if (
-                    outcome.status == "required_action_failed"
+                    (
+                        outcome.status == "required_action_failed"
+                        or outcome.action is None
+                    )
                     and outcome.illegal_corrections > 0
                 ):
                     stop_reason = "required_illegal_action_failed"
@@ -567,6 +574,9 @@ class GameOrchestrator:
                         return
 
                 if failure is not None and not correction_used:
+                    if outcome.illegal_corrections > 0:
+                        stop_reason = "required_illegal_action_failed"
+                        break
                     correction_used = True
                     await self._commit_events(
                         (
@@ -647,7 +657,7 @@ class GameOrchestrator:
                 committed.append(record)
                 break
             if recovering:
-                await self._publish_reload_and_resume()
+                await self._publish_reload_and_resume(clear_stop_requested=False)
         return tuple(committed)
 
     async def _safe_point(self) -> None:
@@ -660,7 +670,9 @@ class GameOrchestrator:
 
     async def _pause_until_continue(self, reason: str) -> None:
         await self._wait_for_continue(reason)
-        await self._publish_reload_and_resume()
+        await self._publish_reload_and_resume(
+            clear_stop_requested=reason == "stop_requested"
+        )
 
     async def _wait_for_continue(self, reason: str) -> None:
         async with self._control_lock:
@@ -672,7 +684,7 @@ class GameOrchestrator:
             self._stopped_event.set()
         await self._continue_event.wait()
 
-    async def _publish_reload_and_resume(self) -> None:
+    async def _publish_reload_and_resume(self, *, clear_stop_requested: bool) -> None:
         while True:
             reload_event = EventRecord(
                 phase=self.rules.state.phase,
@@ -688,7 +700,8 @@ class GameOrchestrator:
             async with self._control_lock:
                 self._continue_pending = False
                 self._continue_event.clear()
-                self._stop_requested = False
+                if clear_stop_requested and self._reason == "stop_requested":
+                    self._stop_requested = False
                 self.rules.state.stopped = False
                 self._runtime_state = "running"
                 self._reason = None

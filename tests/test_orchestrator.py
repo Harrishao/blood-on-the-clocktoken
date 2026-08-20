@@ -214,6 +214,54 @@ async def test_required_agent_illegal_exhaustion_stops_without_second_run_action
             await task
 
 
+@pytest.mark.parametrize("failure_source", ["missing", "accepts", "rules"])
+async def test_completed_required_outcome_with_internal_correction_gets_no_external_correction(
+    tmp_path,
+    failure_source,
+):
+    """Any internal correction use exhausts legality credit even when status says completed."""
+
+    class InternallyCorrectedButIllegalAgent(NightAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            action = None
+            if failure_source != "missing":
+                action = UseAbility(
+                    actor=self.player_id,
+                    action=("imp" if failure_source == "accepts" else scene.details["ability"]),
+                    targets=(
+                        tuple(scene.details["legal_targets"][0])
+                        if failure_source == "accepts"
+                        else ("not-a-player",)
+                    ),
+                )
+            return AgentOutcome(
+                action=action,
+                status="completed",
+                round_trips=2,
+                illegal_corrections=1,
+            )
+
+    agents = {
+        player_id: NightAgent(player_id)
+        for player_id in ("alice", "bob", "carol", "david", "eve")
+    }
+    agents["david"] = InternallyCorrectedButIllegalAgent("david")
+    orchestrator, rules, history = make_orchestrator(tmp_path, agents)
+    task = asyncio.create_task(orchestrator.run())
+    try:
+        await asyncio.wait_for(orchestrator.wait_until_stopped(), timeout=1)
+
+        assert orchestrator.status().reason == "required_illegal_action_failed"
+        assert len(agents["david"].scenes) == 1
+        assert rules.state.role_state.pending_night_role == "poisoner"
+        assert not any(event.type == "tool.error" for event in history.stream.after(0))
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_required_missing_action_has_its_own_single_retry_and_reason(tmp_path):
     """A valid provider response without a required action is neither provider failure nor fresh correction."""
 
@@ -393,6 +441,71 @@ async def test_history_failure_stops_before_rules_then_continue_retries_history_
         assert orchestrator.status().history_path == str(history.path)
     finally:
         release.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_stop_requested_during_history_pause_survives_recovery_until_next_safe_point(tmp_path):
+    """History recovery cannot erase a later Stop; a second Continue is required to run models."""
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    agents = {
+        player_id: NightAgent(
+            player_id,
+            started=started if player_id == "david" else None,
+            release=release if player_id == "david" else None,
+        )
+        for player_id in ("alice", "bob", "carol", "david", "eve")
+    }
+    reloads: list[str] = []
+    orchestrator, rules, history = make_orchestrator(
+        tmp_path,
+        agents,
+        history_type=ToggleHistoryWriter,
+        reload_model_config=lambda: reloads.append("reloaded"),
+    )
+    task = asyncio.create_task(orchestrator.run())
+    reason_waiter: asyncio.Task[None] | None = None
+    started_waiter: asyncio.Task[bool] | None = None
+    try:
+        await asyncio.wait_for(orchestrator.wait_until_stopped(), timeout=1)
+        assert orchestrator.status().reason == "history_write_failed"
+
+        await orchestrator.request_stop()
+        history.fail_writes = False
+        await orchestrator.continue_game()
+
+        async def wait_for_stop_reason():
+            while orchestrator.status().reason != "stop_requested":
+                await asyncio.sleep(0)
+
+        reason_waiter = asyncio.create_task(wait_for_stop_reason())
+        started_waiter = asyncio.create_task(started.wait())
+        done, _pending = await asyncio.wait(
+            {reason_waiter, started_waiter},
+            timeout=1,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        assert reason_waiter in done
+        assert not started.is_set()
+        assert orchestrator.status().state == "stopped"
+        assert [event.type for event in history.stream.after(0)[:2]] == [
+            "game.header",
+            "model_config_reloaded",
+        ]
+
+        await orchestrator.continue_game()
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert orchestrator.status().state == "running"
+        assert reloads == ["reloaded", "reloaded"]
+        assert rules.state.role_state.pending_night_role == "poisoner"
+    finally:
+        release.set()
+        for waiter in (reason_waiter, started_waiter):
+            if waiter is not None and not waiter.done():
+                waiter.cancel()
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

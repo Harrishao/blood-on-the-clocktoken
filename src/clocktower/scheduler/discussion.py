@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from clocktower.agents.context import is_safe_public_event
@@ -25,6 +26,21 @@ from .scoring import CandidateScore, ScoreContext, choose_candidate, score_candi
 
 class _Rules(Protocol):
     def apply_action(self, action: PlayerAction) -> list[EventRecord]: ...
+
+
+@dataclass(frozen=True)
+class _PendingActionCommit:
+    """One already-evaluated model/rule action awaiting durable publication."""
+
+    events: tuple[EventRecord, ...]
+    selected_id: str
+    action_count_after: int
+    selected_action_count_after: int
+    quiet_count_after: int
+    last_speaker_after: str | None
+    end_reason_after: str | None
+    private_request: RequestPrivateChat | None = None
+    action: PlayerAction | None = None
 
 
 class DiscussionScheduler:
@@ -71,17 +87,24 @@ class DiscussionScheduler:
         self.probed_player_ids: tuple[str, ...] = ()
         self.probe_adjustments: dict[str, int] = {}
         self.pending_private_request: RequestPrivateChat | None = None
+        self.pending_action_commit: _PendingActionCommit | None = None
         self._selection_number = 0
 
     async def step(self) -> list[EventRecord]:
         """Audit one ranking, probe at most two players, then run at most one normal action."""
 
-        if self.end_reason is not None:
-            return []
         state = self._state_provider()
         if state.stopped:
+            if self.pending_action_commit is not None:
+                return []
             events = list(await self._emit((self._stop_event(),)))
             return events
+        if self.pending_action_commit is not None:
+            committed = await self._commit_pending_action()
+            await self._at_safe_point()
+            return committed
+        if self.end_reason is not None:
+            return []
         if self.action_count >= self.action_budget:
             events = list(await self._emit((self._end("action_budget"),)))
             return events
@@ -170,19 +193,20 @@ class DiscussionScheduler:
             try:
                 outcome = await agent.run_action(scene)
             except ModelCallError:
-                self._increment_quiet()
-                yielded_events = self.rules.apply_action(
-                    YieldAction(actor=selected_id, reason="model_call_failed")
-                )
-                failed_events = list(await self._emit((
-                    self._observer_event(
+                yielded_action = YieldAction(actor=selected_id, reason="model_call_failed")
+                yielded_events = self.rules.apply_action(yielded_action)
+                self._prepare_quiet_commit(
+                    selected_id,
+                    (
+                        self._observer_event(
                         "scheduler.normal_action_failed",
                         {"player_id": selected_id, "reason": "model_call_failed_after_retry"},
+                        ),
+                        *yielded_events,
                     ),
-                    *yielded_events,
-                    *self._quiet_events([]),
-                )))
-                self._update_public_trigger(failed_events)
+                    action=yielded_action,
+                )
+                failed_events = await self._commit_pending_action()
                 await self._at_safe_point()
                 return events + failed_events
         outcome_events = await self._apply_with_rule_correction(
@@ -202,7 +226,7 @@ class DiscussionScheduler:
         outcome: AgentOutcome,
     ) -> list[EventRecord]:
         try:
-            outcome_events = self._apply_outcome(selected_id, outcome)
+            self._prepare_outcome(selected_id, outcome)
         except IllegalAction as first_error:
             correction = (await self._emit((self._tool_error(selected_id, first_error),)))[0]
             await self._at_safe_point()
@@ -221,28 +245,39 @@ class DiscussionScheduler:
                             stopped = self._stop_event()
                             return [correction, *(await self._emit((stopped,)))]
                         continue
-                    failure_events = self._optional_failure_events(
+                    failure_events, failure_action = self._optional_failure_events(
                         selected_id,
                         reason="model_call_failed_after_retry",
                     )
-                    committed_failures = list(await self._emit(failure_events))
-                    self._update_public_trigger(committed_failures)
+                    self._prepare_quiet_commit(
+                        selected_id,
+                        failure_events,
+                        action=failure_action,
+                    )
+                    committed_failures = await self._commit_pending_action()
                     return [correction, *committed_failures]
                 break
 
             if corrected is None:
-                failure_events = self._optional_failure_events(
+                failure_events, failure_action = self._optional_failure_events(
                     selected_id,
                     reason="missing_correction",
                 )
-                committed_failures = list(await self._emit(failure_events))
-                self._update_public_trigger(committed_failures)
+                self._prepare_quiet_commit(
+                    selected_id,
+                    failure_events,
+                    action=failure_action,
+                )
+                committed_failures = await self._commit_pending_action()
                 return [correction, *committed_failures]
             try:
-                outcome_events = self._apply_outcome(selected_id, corrected)
+                self._prepare_outcome(selected_id, corrected)
             except IllegalAction as second_error:
-                self._increment_quiet()
-                outcome_events = [
+                yielded_action = YieldAction(
+                    actor=selected_id,
+                    reason="illegal_action_after_correction",
+                )
+                outcome_events = (
                     self._observer_event(
                         "scheduler.action_rejected",
                         {
@@ -250,31 +285,33 @@ class DiscussionScheduler:
                             "reason": type(second_error).__name__,
                         },
                     ),
-                    *self.rules.apply_action(
-                        YieldAction(actor=selected_id, reason="illegal_action_after_correction")
-                    ),
-                    *self._quiet_events([]),
-                ]
-            committed_outcome = list(await self._emit(outcome_events))
-            self._update_public_trigger(committed_outcome)
+                    *self.rules.apply_action(yielded_action),
+                )
+                self._prepare_quiet_commit(
+                    selected_id,
+                    outcome_events,
+                    action=yielded_action,
+                )
+            committed_outcome = await self._commit_pending_action()
             return [correction, *committed_outcome]
 
-        committed_outcome = list(await self._emit(outcome_events))
-        self._update_public_trigger(committed_outcome)
+        committed_outcome = await self._commit_pending_action()
         return committed_outcome
 
-    def _optional_failure_events(self, player_id: str, *, reason: str) -> list[EventRecord]:
-        self._increment_quiet()
+    def _optional_failure_events(
+        self,
+        player_id: str,
+        *,
+        reason: str,
+    ) -> tuple[list[EventRecord], YieldAction]:
+        action = YieldAction(actor=player_id, reason="model_call_failed")
         return [
             self._observer_event(
                 "scheduler.normal_action_failed",
                 {"player_id": player_id, "reason": reason},
             ),
-            *self.rules.apply_action(
-                YieldAction(actor=player_id, reason="model_call_failed")
-            ),
-            *self._quiet_events([]),
-        ]
+            *self.rules.apply_action(action),
+        ], action
 
     async def _probe_top_two(
         self,
@@ -333,50 +370,139 @@ class DiscussionScheduler:
             audit_events,
         )
 
-    def _apply_outcome(self, selected_id: str, outcome: AgentOutcome) -> list[EventRecord]:
+    def _prepare_outcome(self, selected_id: str, outcome: AgentOutcome) -> None:
         if self._state_provider().stopped:
-            return [self._stop_event()]
+            self.pending_action_commit = _PendingActionCommit(
+                events=(self._observer_event(
+                    "scheduler.stopped",
+                    {"action_count": self.action_count, "quiet_count": self.quiet_count},
+                ),),
+                selected_id=selected_id,
+                action_count_after=self.action_count,
+                selected_action_count_after=self.action_counts.get(selected_id, 0),
+                quiet_count_after=self.quiet_count,
+                last_speaker_after=self.last_speaker,
+                end_reason_after="stopped",
+                action=outcome.action,
+            )
+            return
         action = outcome.action
         if action is None or isinstance(action, YieldAction):
-            self._increment_quiet()
-            return self._quiet_events([])
+            self._prepare_quiet_commit(selected_id, (), action=action)
+            return
         if not _is_public_discussion_action(action, selected_id):
             if (
                 self.allow_private_chat_requests
                 and isinstance(action, RequestPrivateChat)
                 and action.actor == selected_id
             ):
-                self.pending_private_request = action
-                self.action_count += 1
-                self.action_counts[selected_id] = self.action_counts.get(selected_id, 0) + 1
-                self.quiet_count = 0
-                return [
-                    self._observer_event(
+                self.pending_action_commit = _PendingActionCommit(
+                    events=(self._observer_event(
                         "scheduler.private_chat_requested",
                         {
                             "player_id": selected_id,
                             "target_player": action.target_player,
                         },
-                    )
-                ]
-            self._increment_quiet()
-            return [
-                self._observer_event(
+                    ),),
+                    selected_id=selected_id,
+                    action_count_after=self.action_count + 1,
+                    selected_action_count_after=self.action_counts.get(selected_id, 0) + 1,
+                    quiet_count_after=0,
+                    last_speaker_after=self.last_speaker,
+                    end_reason_after=self.end_reason,
+                    private_request=action,
+                    action=action,
+                )
+                return
+            self._prepare_quiet_commit(
+                selected_id,
+                (self._observer_event(
                     "scheduler.action_rejected",
                     {"player_id": selected_id, "reason": "non_public_or_wrong_actor"},
-                ),
-                *self._quiet_events([]),
-            ]
+                ),),
+                action=action,
+            )
+            return
         rule_events = self.rules.apply_action(action)
-
-        self.action_count += 1
-        self.action_counts[selected_id] = self.action_counts.get(selected_id, 0) + 1
-        self.last_speaker = selected_id
-        self.quiet_count = 0
+        action_count_after = self.action_count + 1
         events = list(rule_events)
-        if self.action_count >= self.action_budget:
-            events.append(self._end("action_budget"))
-        return events
+        end_reason = self.end_reason
+        if action_count_after >= self.action_budget:
+            end_reason = "action_budget"
+            events.append(
+                self._observer_event(
+                    "scheduler.ended",
+                    {
+                        "reason": "action_budget",
+                        "action_count": action_count_after,
+                        "quiet_count": 0,
+                    },
+                )
+            )
+        self.pending_action_commit = _PendingActionCommit(
+            events=tuple(events),
+            selected_id=selected_id,
+            action_count_after=action_count_after,
+            selected_action_count_after=self.action_counts.get(selected_id, 0) + 1,
+            quiet_count_after=0,
+            last_speaker_after=selected_id,
+            end_reason_after=end_reason,
+            action=action,
+        )
+
+    def _prepare_quiet_commit(
+        self,
+        selected_id: str,
+        prefix: Sequence[EventRecord],
+        *,
+        action: PlayerAction | None = None,
+    ) -> None:
+        quiet_count_after = self.quiet_count + 1
+        events = [
+            *prefix,
+            self._observer_event(
+                "scheduler.quiet_window",
+                {"quiet_count": quiet_count_after, "eligible_count": 0},
+            ),
+        ]
+        end_reason = self.end_reason
+        if quiet_count_after >= self.quiet_windows:
+            end_reason = "quiet"
+            events.append(
+                self._observer_event(
+                    "scheduler.ended",
+                    {
+                        "reason": "quiet",
+                        "action_count": self.action_count,
+                        "quiet_count": quiet_count_after,
+                    },
+                )
+            )
+        self.pending_action_commit = _PendingActionCommit(
+            events=tuple(events),
+            selected_id=selected_id,
+            action_count_after=self.action_count,
+            selected_action_count_after=self.action_counts.get(selected_id, 0),
+            quiet_count_after=quiet_count_after,
+            last_speaker_after=self.last_speaker,
+            end_reason_after=end_reason,
+            action=action,
+        )
+
+    async def _commit_pending_action(self) -> list[EventRecord]:
+        pending = self.pending_action_commit
+        if pending is None:
+            raise RuntimeError("no prepared discussion action to commit")
+        committed = list(await self._emit(pending.events))
+        self.action_count = pending.action_count_after
+        self.action_counts[pending.selected_id] = pending.selected_action_count_after
+        self.quiet_count = pending.quiet_count_after
+        self.last_speaker = pending.last_speaker_after
+        self.end_reason = pending.end_reason_after
+        self.pending_private_request = pending.private_request
+        self.pending_action_commit = None
+        self._update_public_trigger(committed)
+        return committed
 
     def _increment_quiet(self) -> None:
         self.quiet_count += 1

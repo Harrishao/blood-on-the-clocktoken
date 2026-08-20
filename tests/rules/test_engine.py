@@ -254,7 +254,7 @@ def test_butler_none_falls_back_to_ordinary_vote_rules_when_poisoned():
     ("nominee", "butler_precedes_master"),
     [("eve", True), ("alice", False)],
 )
-def test_butler_vote_uses_the_completed_round_independent_of_seat_order(
+def test_public_vote_events_reconcile_completed_round_independent_of_seat_order(
     master_vote,
     expected_tally,
     nominee,
@@ -294,16 +294,71 @@ def test_butler_vote_uses_the_completed_round_independent_of_seat_order(
         )
 
     closed = next(event for event in events if event.type == "nomination.closed")
-    resolution = next(event for event in events if event.type == "vote.rule_resolved")
+    observer_resolution = next(
+        event for event in events if event.type == "vote.rule_resolved"
+    )
     assert closed.payload["tally"] == expected_tally
-    assert resolution.audience == Audience.observer()
-    assert resolution.payload == {
+    assert observer_resolution.audience == Audience.observer()
+    assert observer_resolution.payload == {
         "voter": "alice",
         "nomination_id": nomination_id,
         "vote": True,
         "counted": master_vote,
         "reason": "butler_master_vote",
     }
+
+    public_events = [
+        event
+        for event in engine.events
+        if event.visible_to("carol")
+        and event.payload.get("nomination_id") == nomination_id
+    ]
+    casts = [event for event in public_events if event.type == "vote.cast"]
+    resolutions = [
+        event for event in public_events if event.type == "vote.resolved"
+    ]
+    assert len(casts) == len(resolutions) == len(order)
+    expected_intents = {
+        "alice": True,
+        "bob": master_vote,
+        "carol": False,
+        "david": False,
+        "eve": False,
+    }
+    assert all(
+        cast.payload["counted"] is None
+        and cast.payload["intended"] is expected_intents[cast.actor]
+        and "vote" not in cast.payload
+        for cast in casts
+    )
+    assert all(
+        set(resolution.payload) == {
+            "voter",
+            "nomination_id",
+            "intended",
+            "counted",
+        }
+        for resolution in resolutions
+    )
+    assert sum(
+        resolution.payload["counted"] for resolution in resolutions
+    ) == closed.payload["tally"]
+    alice_resolution = next(
+        resolution
+        for resolution in resolutions
+        if resolution.payload["voter"] == "alice"
+    )
+    assert alice_resolution.payload["intended"] is True
+    assert alice_resolution.payload["counted"] is master_vote
+    assert all(
+        "butler" not in str(event.payload).lower()
+        and "master" not in str(event.payload).lower()
+        for event in public_events
+    )
+    closed_index = engine.events.index(closed)
+    assert all(
+        engine.events.index(resolution) < closed_index for resolution in resolutions
+    )
 
 
 def test_virgin_policy_resolution_executes_then_ends_day_in_event_order():

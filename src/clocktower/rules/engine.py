@@ -429,10 +429,11 @@ class RuleEngine:
         record = tracker.cast_vote(
             self.state, action.actor, action.nomination_id, action.vote
         )
-        vote_resolutions: tuple[dict[str, Any], ...] = ()
+        public_resolutions: tuple[dict[str, Any], ...] = ()
+        rule_resolutions: tuple[dict[str, Any], ...] = ()
         if tracker.active_nomination_id is None:
-            tally, vote_resolutions = self._resolve_completed_tally(
-                tracker, action.nomination_id
+            tally, public_resolutions, rule_resolutions = (
+                self._resolve_completed_tally(tracker, action.nomination_id)
             )
             tracker.record_resolved_tally(action.nomination_id, tally)
 
@@ -457,7 +458,8 @@ class RuleEngine:
                         "payload": {
                             "voter": action.actor,
                             "nomination_id": action.nomination_id,
-                            "vote": action.vote,
+                            "intended": action.vote,
+                            "counted": None,
                             "consumes_dead_vote": record.consumes_dead_vote,
                         },
                     },
@@ -471,13 +473,27 @@ class RuleEngine:
                     RuleEffect(
                         "emit_event",
                         {
+                            "type": "vote.resolved",
+                            "actor": resolution["voter"],
+                            "audience": Audience.public(),
+                            "payload": resolution,
+                        },
+                    )
+                )
+                for resolution in public_resolutions
+            )
+            effects.extend(
+                _PendingEffect(
+                    RuleEffect(
+                        "emit_event",
+                        {
                             "type": "vote.rule_resolved",
                             "audience": Audience.observer(),
                             "payload": resolution,
                         },
                     )
                 )
-                for resolution in vote_resolutions
+                for resolution in rule_resolutions
             )
             effects.extend(
                 (
@@ -503,11 +519,16 @@ class RuleEngine:
         self,
         tracker: NominationTracker,
         nomination_id: str,
-    ) -> tuple[int, tuple[dict[str, Any], ...]]:
+    ) -> tuple[
+        int,
+        tuple[dict[str, Any], ...],
+        tuple[dict[str, Any], ...],
+    ]:
         votes = tracker.votes_for(nomination_id)
         master_votes = {vote.voter: vote.vote for vote in votes}
         tally = 0
-        resolutions: list[dict[str, Any]] = []
+        public_resolutions: list[dict[str, Any]] = []
+        rule_resolutions: list[dict[str, Any]] = []
         for vote in votes:
             counted = vote.vote
             player = self.state.players[vote.voter]
@@ -520,7 +541,7 @@ class RuleEngine:
                     ),
                 )
                 counted = may_vote is not False
-                resolutions.append(
+                rule_resolutions.append(
                     {
                         "voter": vote.voter,
                         "nomination_id": nomination_id,
@@ -530,7 +551,15 @@ class RuleEngine:
                     }
                 )
             tally += int(counted)
-        return tally, tuple(resolutions)
+            public_resolutions.append(
+                {
+                    "voter": vote.voter,
+                    "nomination_id": nomination_id,
+                    "intended": vote.vote,
+                    "counted": bool(counted),
+                }
+            )
+        return tally, tuple(public_resolutions), tuple(rule_resolutions)
 
     def _dispatch_ability(self, action: UseAbility) -> tuple[_PendingEffect, ...]:
         if self.state.phase == "night":

@@ -85,6 +85,7 @@ def test_structured_attention_matches_only_the_current_public_event():
     """Applying nonempty attention to every event would create permanent hidden scheduling bias."""
 
     state = sample_game_state()
+    state.phase = "day.discussion"
     state.players["bob"].notebook.attention = NotebookAttention(
         players=["alice"],
         watch_triggers=["claim.public"],
@@ -116,6 +117,7 @@ def test_pending_action_uses_discussion_tool_availability_without_an_event_actio
     """Production public events do not need an artificial action_key to make a pending nomination relevant."""
 
     state = sample_game_state()
+    state.phase = "day.discussion"
     state.players["bob"].notebook.attention = NotebookAttention(pending_actions=["nominate"])
     score = {score.player_id: score for score in score_candidates(public_claim(actor="alice", mentions=set()), state)}["bob"]
 
@@ -126,6 +128,31 @@ def test_pending_action_uses_discussion_tool_availability_without_an_event_actio
     state.players["bob"].notebook.attention = NotebookAttention(pending_actions=["use_ability"])
     invalid = {score.player_id: score for score in score_candidates(public_claim(actor="alice", mentions=set()), state)}["bob"]
     assert next(feature for feature in invalid.features if feature.name == "pending_action").contribution == 0
+
+
+def test_pending_action_requires_the_authoritative_exact_discussion_phase():
+    """Trusting only the event phase lets stale or invented phases create a permanent nomination bias."""
+
+    state = sample_game_state()
+    state.players["bob"].notebook.attention = NotebookAttention(pending_actions=["nominate"])
+    event = public_claim(actor="alice", mentions=set())
+
+    def pending_score() -> int:
+        score = {item.player_id: item for item in score_candidates(event, state)}["bob"]
+        return next(feature for feature in score.features if feature.name == "pending_action").contribution
+
+    state.phase = "night"
+    assert pending_score() == 0
+
+    state.phase = "day.discussion.invalid"
+    assert pending_score() == 0
+
+    state.phase = "day.discussion"
+    event.phase = "day.nomination"
+    assert score_candidates(event, state) == []
+
+    event.phase = "day.discussion"
+    assert pending_score() == 15
 
 
 def test_dead_player_with_an_agent_remains_a_discussion_candidate():

@@ -22,6 +22,10 @@ WEIGHTS = {
     "budget_pressure": -15,
 }
 
+_PHASE_ACTIONS: dict[str, frozenset[str]] = {
+    "day.discussion": frozenset({"speak_public", "nominate", "request_private_chat"}),
+}
+
 
 @dataclass(frozen=True, slots=True)
 class FeatureContribution:
@@ -97,6 +101,8 @@ def score_candidates(
             related_player_ids=related_player_ids,
             trigger_keys=trigger_keys,
             action_keys=action_keys,
+            state_phase=state.phase,
+            event_phase=event.phase,
             action_count=action_counts.get(player.player_id, 0),
             minimum_actions=minimum_actions,
             last_speaker=context.last_speaker,
@@ -136,6 +142,8 @@ def _score_player(
     related_player_ids: frozenset[str],
     trigger_keys: frozenset[str],
     action_keys: frozenset[str],
+    state_phase: str,
+    event_phase: str,
     action_count: int,
     minimum_actions: int,
     last_speaker: str | None,
@@ -143,10 +151,10 @@ def _score_player(
 ) -> CandidateScore:
     matched_attention_players = tuple(sorted(set(attention.players) & set(related_player_ids)))
     matched_watch_triggers = tuple(sorted(set(attention.watch_triggers) & set(trigger_keys)))
-    discussion_actions = {"speak_public", "nominate", "request_private_chat"}
-    safe_explicit_actions = set(action_keys) & discussion_actions
+    phase_actions = _PHASE_ACTIONS.get(state_phase, frozenset()) if state_phase == event_phase else frozenset()
+    safe_explicit_actions = set(action_keys) & set(phase_actions)
     matched_pending_actions = tuple(
-        sorted(set(attention.pending_actions) & (discussion_actions | safe_explicit_actions))
+        sorted(set(attention.pending_actions) & (set(phase_actions) | safe_explicit_actions))
     )
     active = {
         "direct_target": player_id in target_ids,

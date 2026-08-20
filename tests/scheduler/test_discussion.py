@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 
 from clocktower.agents.player import AgentOutcome, ReactionProbe
-from clocktower.domain.actions import RequestPrivateChat, SpeakPublic
+from clocktower.domain.actions import IllegalAction, Nominate, RequestPrivateChat, SpeakPublic, YieldAction
 from clocktower.domain.events import Audience, EventRecord
 from clocktower.history import HistoryWriteError
 from clocktower.models.protocol import ModelCallError
@@ -122,6 +122,73 @@ async def test_scheduler_rejects_private_action_and_never_sends_it_to_rules():
     assert any(event.type == "scheduler.action_rejected" for event in events)
 
 
+async def test_orchestrated_discussion_surfaces_private_request_without_sending_it_to_rules():
+    """Rejecting an authorized private request would make day/private alternation unreachable."""
+
+    scheduler, agents, rules = make_scheduler(allow_private_chat_requests=True)
+    for player_id, agent in agents.items():
+        target = "bob" if player_id != "bob" else "alice"
+        agent.action = RequestPrivateChat(actor=player_id, target_player=target)
+
+    events = await scheduler.step()
+
+    assert rules.actions == []
+    assert scheduler.action_count == 1
+    assert scheduler.pending_private_request is not None
+    assert scheduler.pending_private_request.actor in agents
+    assert any(event.type == "scheduler.private_chat_requested" for event in events)
+
+
+async def test_orchestrator_hooks_commit_scheduler_facts_before_dependent_calls_and_check_safe_points():
+    """Returning every audit event at step end would place rankings after their model calls."""
+
+    markers: list[str] = []
+
+    class OrderedAgent(ScriptedAgent):
+        async def probe(self, event):
+            markers.append(f"probe:{self.action.actor}")
+            return await super().probe(event)
+
+        async def run_action(self, scene):
+            markers.append(f"normal:{self.action.actor}")
+            return await super().run_action(scene)
+
+    async def event_sink(events):
+        markers.extend(f"event:{event.type}" for event in events)
+
+    safe_points = 0
+
+    async def safe_point():
+        nonlocal safe_points
+        safe_points += 1
+
+    state = sample_game_state()
+    state.phase = "day.discussion"
+    agents = {
+        player_id: OrderedAgent(action=SpeakPublic(actor=player_id, text="ordered"))
+        for player_id in state.players
+    }
+    scheduler = DiscussionScheduler(
+        state_provider=lambda: state,
+        agents=agents,
+        rules=RecordingRules(),
+        trigger_event=public_claim(actor="alice", mentions={"bob"}),
+        seed=17,
+        event_sink=event_sink,
+        safe_point=safe_point,
+    )
+
+    await scheduler.step()
+
+    ranking = markers.index("event:scheduler.ranking")
+    first_probe = next(index for index, marker in enumerate(markers) if marker.startswith("probe:"))
+    selection = markers.index("event:scheduler.selection")
+    normal = next(index for index, marker in enumerate(markers) if marker.startswith("normal:"))
+    public = markers.index("event:player.public_message")
+    assert ranking < first_probe < selection < normal < public
+    assert safe_points == 3
+
+
 async def test_quiet_windows_and_hard_action_budget_end_the_scene():
     """Without both guards, a no-response scene could spin forever."""
 
@@ -212,6 +279,38 @@ async def test_normal_model_call_retries_once_but_history_failure_propagates():
     assert len(rules.actions) == 1
 
 
+async def test_optional_normal_failure_retries_once_then_commits_a_yield():
+    """Two provider failures must become a visible yield, never an invented public action."""
+
+    @dataclass
+    class YieldAwareRules(RecordingRules):
+        def apply_action(self, action):
+            self.actions.append(action)
+            return [
+                EventRecord(
+                    phase="day.discussion",
+                    type="player.yielded",
+                    actor=action.actor,
+                    audience=Audience.public(),
+                    payload={"reason": action.reason},
+                )
+            ]
+
+    scheduler, agents, _rules = make_scheduler()
+    rules = YieldAwareRules()
+    scheduler.rules = rules
+    for agent in agents.values():
+        agent.action = [ModelCallError("first"), ModelCallError("second")]
+
+    events = await scheduler.step()
+
+    selected = next(player_id for player_id, agent in agents.items() if agent.scenes)
+    assert len(agents[selected].scenes) == 2
+    assert len(rules.actions) == 1
+    assert isinstance(rules.actions[0], YieldAction)
+    assert any(event.type == "player.yielded" for event in events)
+
+
 async def test_history_write_failure_from_normal_action_is_not_swallowed():
     """A history failure in the normal call cannot be downgraded to an optional yield."""
 
@@ -223,6 +322,101 @@ async def test_history_write_failure_from_normal_action_is_not_swallowed():
 
     with pytest.raises(HistoryWriteError, match="normal disk failure"):
         await scheduler.step()
+
+
+async def test_rule_illegal_action_gets_one_private_correction_turn():
+    """Rule legality is known only after the model call, so the selected player gets one correction."""
+
+    @dataclass
+    class RejectFirstNominationRules:
+        actions: list[object] = field(default_factory=list)
+
+        def apply_action(self, action):
+            self.actions.append(action)
+            if isinstance(action, Nominate):
+                raise IllegalAction("nomination is no longer legal")
+            return [
+                EventRecord(
+                    phase="day.discussion",
+                    type="player.public_message",
+                    actor=action.actor,
+                    audience=Audience.public(),
+                    payload={"text": action.text},
+                )
+            ]
+
+    scheduler, agents, _rules = make_scheduler()
+    rules = RejectFirstNominationRules()
+    scheduler.rules = rules
+    for player_id, agent in agents.items():
+        target = "bob" if player_id != "bob" else "alice"
+        agent.action = [
+            AgentOutcome(
+                action=Nominate(actor=player_id, target=target, accusation="first"),
+                round_trips=1,
+            ),
+            AgentOutcome(
+                action=SpeakPublic(actor=player_id, text="corrected"),
+                round_trips=1,
+            ),
+        ]
+
+    events = await scheduler.step()
+
+    selected_id = next(player_id for player_id, agent in agents.items() if agent.scenes)
+    assert len(agents[selected_id].scenes) == 2
+    assert len(rules.actions) == 2
+    correction = next(event for event in events if event.type == "tool.error")
+    assert correction.actor == selected_id
+    assert correction.audience == Audience.player(selected_id)
+    assert any(event.type == "player.public_message" for event in events)
+
+
+async def test_second_rule_illegal_action_becomes_visible_optional_yield():
+    """The one correction allowance must not become an unbounded rule-rejection loop."""
+
+    @dataclass
+    class RejectNominationsRules:
+        actions: list[object] = field(default_factory=list)
+
+        def apply_action(self, action):
+            self.actions.append(action)
+            if isinstance(action, Nominate):
+                raise IllegalAction("still illegal")
+            return [
+                EventRecord(
+                    phase="day.discussion",
+                    type="player.yielded",
+                    actor=action.actor,
+                    audience=Audience.public(),
+                    payload={"reason": action.reason},
+                )
+            ]
+
+    scheduler, agents, _rules = make_scheduler()
+    rules = RejectNominationsRules()
+    scheduler.rules = rules
+    for player_id, agent in agents.items():
+        target = "bob" if player_id != "bob" else "alice"
+        agent.action = [
+            AgentOutcome(
+                action=Nominate(actor=player_id, target=target, accusation="first"),
+                round_trips=1,
+            ),
+            AgentOutcome(
+                action=Nominate(actor=player_id, target=target, accusation="second"),
+                round_trips=1,
+            ),
+        ]
+
+    events = await scheduler.step()
+
+    selected_id = next(player_id for player_id, agent in agents.items() if agent.scenes)
+    assert len(agents[selected_id].scenes) == 2
+    assert [type(action) for action in rules.actions] == [Nominate, Nominate, YieldAction]
+    assert sum(event.type == "tool.error" for event in events) == 1
+    assert any(event.type == "scheduler.action_rejected" for event in events)
+    assert any(event.type == "player.yielded" for event in events)
 
 
 async def test_forged_public_checkpoint_never_reaches_probe_or_normal_action():
@@ -319,6 +513,34 @@ async def test_stop_after_first_normal_model_failure_prevents_retry():
 
     assert scheduler.end_reason == "stopped"
     assert len(agents["alice"].scenes) == 1
+    assert rules.actions == []
+    assert events[-1].type == "scheduler.stopped"
+
+
+async def test_stop_request_reaches_safe_point_before_failed_probe_retry():
+    """The short-call retry is a new model call and may only start after the owner safe point."""
+
+    stop_requested = False
+
+    async def safe_point():
+        if stop_requested:
+            scheduler.test_state.stopped = True
+
+    class RequestStopOnProbeFailure(ScriptedAgent):
+        async def probe(self, event):
+            nonlocal stop_requested
+            self.probes.append(event.actor or "")
+            stop_requested = True
+            raise ModelCallError("short unavailable")
+
+    scheduler, agents, rules = make_scheduler(safe_point=safe_point)
+    agents["alice"] = RequestStopOnProbeFailure()
+    scheduler.agents = agents
+
+    events = await scheduler.step()
+
+    assert len(agents["alice"].probes) == 1
+    assert all(not agent.probes for player_id, agent in agents.items() if player_id != "alice")
     assert rules.actions == []
     assert events[-1].type == "scheduler.stopped"
 

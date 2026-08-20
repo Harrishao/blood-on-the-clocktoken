@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any, Protocol
 
 from clocktower.agents.context import is_safe_public_event
 from clocktower.agents.player import AgentOutcome, AgentScene, PlayerAgent, ReactionProbe
-from clocktower.domain.actions import IllegalAction, Nominate, PlayerAction, SpeakPublic, YieldAction
+from clocktower.domain.actions import (
+    IllegalAction,
+    Nominate,
+    PlayerAction,
+    RequestPrivateChat,
+    SpeakPublic,
+    YieldAction,
+)
 from clocktower.domain.events import Audience, EventRecord
 from clocktower.domain.state import GameState
 from clocktower.rules.engine import RuleEngine
@@ -35,6 +42,9 @@ class DiscussionScheduler:
         quiet_windows: int = 3,
         per_player_action_limit: int = 2,
         eligibility_threshold: int = 1,
+        allow_private_chat_requests: bool = False,
+        event_sink: Callable[[Sequence[EventRecord]], Awaitable[object]] | None = None,
+        safe_point: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         if action_budget <= 0 or quiet_windows <= 0 or per_player_action_limit <= 0:
             raise ValueError("discussion budgets must be positive")
@@ -49,6 +59,9 @@ class DiscussionScheduler:
         self.quiet_windows = quiet_windows
         self.per_player_action_limit = per_player_action_limit
         self.eligibility_threshold = eligibility_threshold
+        self.allow_private_chat_requests = allow_private_chat_requests
+        self._event_sink = event_sink
+        self._safe_point = safe_point
         self.action_count = 0
         self.quiet_count = 0
         self.end_reason: str | None = None
@@ -57,6 +70,7 @@ class DiscussionScheduler:
         self.initial_ranking: tuple[str, ...] = ()
         self.probed_player_ids: tuple[str, ...] = ()
         self.probe_adjustments: dict[str, int] = {}
+        self.pending_private_request: RequestPrivateChat | None = None
         self._selection_number = 0
 
     async def step(self) -> list[EventRecord]:
@@ -66,13 +80,19 @@ class DiscussionScheduler:
             return []
         state = self._state_provider()
         if state.stopped:
-            return [self._stop_event()]
+            events = [self._stop_event()]
+            await self._emit(events)
+            return events
         if self.action_count >= self.action_budget:
-            return [self._end("action_budget")]
+            events = [self._end("action_budget")]
+            await self._emit(events)
+            return events
 
         if not is_safe_public_event(self.trigger_event) or not state.phase.startswith("day.discussion"):
             self._increment_quiet()
-            return self._quiet_events([])
+            events = self._quiet_events([])
+            await self._emit(events)
+            return events
 
         base_scores = score_candidates(
             self.trigger_event,
@@ -86,14 +106,19 @@ class DiscussionScheduler:
         )
         self.initial_ranking = tuple(score.player_id for score in base_scores)
         events = [self._ranking_event(base_scores)]
+        await self._emit(events)
         if not base_scores:
             self._increment_quiet()
-            return events + self._quiet_events(base_scores)
+            quiet_events = self._quiet_events(base_scores)
+            await self._emit(quiet_events)
+            return events + quiet_events
 
         adjusted_scores, probe_events = await self._probe_top_two(base_scores)
         events.extend(probe_events)
         if self._state_provider().stopped:
-            events.append(self._stop_event())
+            stopped = self._stop_event()
+            events.append(stopped)
+            await self._emit((stopped,))
             return events
         eligible = [
             score
@@ -107,38 +132,148 @@ class DiscussionScheduler:
         self._selection_number += 1
         if selected_id is None:
             self._increment_quiet()
-            return events + self._quiet_events(adjusted_scores)
+            quiet_events = self._quiet_events(adjusted_scores)
+            await self._emit(quiet_events)
+            return events + quiet_events
 
         selected_score = next(score for score in adjusted_scores if score.player_id == selected_id)
-        events.append(self._selection_event(selected_score))
+        selection_event = self._selection_event(selected_score)
+        events.append(selection_event)
+        await self._emit((selection_event,))
         agent = self.agents.get(selected_id)
         if agent is None:
             self._increment_quiet()
-            events.append(self._observer_event("scheduler.action_rejected", {"player_id": selected_id, "reason": "missing_agent"}))
-            return events + self._quiet_events(adjusted_scores)
+            rejected = self._observer_event("scheduler.action_rejected", {"player_id": selected_id, "reason": "missing_agent"})
+            quiet_events = self._quiet_events(adjusted_scores)
+            events.append(rejected)
+            await self._emit((rejected, *quiet_events))
+            return events + quiet_events
 
         scene = AgentScene(
             phase="day.discussion",
             purpose="public_discussion",
-            allowed_tools=("speak_public", "nominate", "yield_action"),
+            allowed_tools=(
+                "speak_public",
+                "nominate",
+                *(("request_private_chat",) if self.allow_private_chat_requests else ()),
+                "yield_action",
+            ),
         )
         try:
             outcome = await agent.run_action(scene)
         except ModelCallError:
+            await self._at_safe_point()
             if self._state_provider().stopped:
-                return events + [self._stop_event()]
+                stopped = self._stop_event()
+                await self._emit((stopped,))
+                return events + [stopped]
             try:
                 outcome = await agent.run_action(scene)
             except ModelCallError:
                 self._increment_quiet()
-                return events + [
+                yielded_events = self.rules.apply_action(
+                    YieldAction(actor=selected_id, reason="model_call_failed")
+                )
+                failed_events = [
                     self._observer_event(
                         "scheduler.normal_action_failed",
                         {"player_id": selected_id, "reason": "model_call_failed_after_retry"},
                     ),
+                    *yielded_events,
                     *self._quiet_events([]),
                 ]
-        return events + self._apply_outcome(selected_id, outcome)
+                await self._emit(failed_events)
+                await self._at_safe_point()
+                return events + failed_events
+        outcome_events = await self._apply_with_rule_correction(
+            selected_id,
+            agent,
+            scene,
+            outcome,
+        )
+        await self._at_safe_point()
+        return events + outcome_events
+
+    async def _apply_with_rule_correction(
+        self,
+        selected_id: str,
+        agent: PlayerAgent,
+        scene: AgentScene,
+        outcome: AgentOutcome,
+    ) -> list[EventRecord]:
+        try:
+            outcome_events = self._apply_outcome(selected_id, outcome)
+        except IllegalAction as first_error:
+            correction = self._tool_error(selected_id, first_error)
+            await self._emit((correction,))
+            await self._at_safe_point()
+            if self._state_provider().stopped:
+                stopped = self._stop_event()
+                await self._emit((stopped,))
+                return [correction, stopped]
+
+            corrected: AgentOutcome | None = None
+            for attempt in range(2):
+                try:
+                    corrected = await agent.run_action(scene)
+                except ModelCallError:
+                    if attempt == 0:
+                        await self._at_safe_point()
+                        if self._state_provider().stopped:
+                            stopped = self._stop_event()
+                            await self._emit((stopped,))
+                            return [correction, stopped]
+                        continue
+                    failure_events = self._optional_failure_events(
+                        selected_id,
+                        reason="model_call_failed_after_retry",
+                    )
+                    await self._emit(failure_events)
+                    return [correction, *failure_events]
+                break
+
+            if corrected is None:
+                failure_events = self._optional_failure_events(
+                    selected_id,
+                    reason="missing_correction",
+                )
+                await self._emit(failure_events)
+                return [correction, *failure_events]
+            try:
+                outcome_events = self._apply_outcome(selected_id, corrected)
+            except IllegalAction as second_error:
+                self._increment_quiet()
+                outcome_events = [
+                    self._observer_event(
+                        "scheduler.action_rejected",
+                        {
+                            "player_id": selected_id,
+                            "reason": type(second_error).__name__,
+                        },
+                    ),
+                    *self.rules.apply_action(
+                        YieldAction(actor=selected_id, reason="illegal_action_after_correction")
+                    ),
+                    *self._quiet_events([]),
+                ]
+            await self._emit(outcome_events)
+            return [correction, *outcome_events]
+
+        await self._emit(outcome_events)
+        return outcome_events
+
+    def _optional_failure_events(self, player_id: str, *, reason: str) -> list[EventRecord]:
+        self._increment_quiet()
+        return [
+            self._observer_event(
+                "scheduler.normal_action_failed",
+                {"player_id": player_id, "reason": reason},
+            ),
+            *self.rules.apply_action(
+                YieldAction(actor=player_id, reason="model_call_failed")
+            ),
+            *self._quiet_events([]),
+        ]
 
     async def _probe_top_two(
         self,
@@ -162,6 +297,7 @@ class DiscussionScheduler:
                         decision = "probe_model_call_failed"
                         if attempt == 1:
                             break
+                        await self._at_safe_point()
                         if self._state_provider().stopped:
                             break
                         continue
@@ -169,6 +305,7 @@ class DiscussionScheduler:
                         decision = "probe_fallback"
                         if attempt == 1:
                             break
+                        await self._at_safe_point()
                         if self._state_provider().stopped:
                             break
                         continue
@@ -185,6 +322,8 @@ class DiscussionScheduler:
                     },
                 )
             )
+            await self._emit((audit_events[-1],))
+            await self._at_safe_point()
         self.probe_adjustments = adjustments
         return (
             [score.with_probe_adjustment(adjustments.get(score.player_id, 0)) for score in base_scores],
@@ -199,6 +338,24 @@ class DiscussionScheduler:
             self._increment_quiet()
             return self._quiet_events([])
         if not _is_public_discussion_action(action, selected_id):
+            if (
+                self.allow_private_chat_requests
+                and isinstance(action, RequestPrivateChat)
+                and action.actor == selected_id
+            ):
+                self.pending_private_request = action
+                self.action_count += 1
+                self.action_counts[selected_id] = self.action_counts.get(selected_id, 0) + 1
+                self.quiet_count = 0
+                return [
+                    self._observer_event(
+                        "scheduler.private_chat_requested",
+                        {
+                            "player_id": selected_id,
+                            "target_player": action.target_player,
+                        },
+                    )
+                ]
             self._increment_quiet()
             return [
                 self._observer_event(
@@ -207,17 +364,7 @@ class DiscussionScheduler:
                 ),
                 *self._quiet_events([]),
             ]
-        try:
-            rule_events = self.rules.apply_action(action)
-        except IllegalAction as error:
-            self._increment_quiet()
-            return [
-                self._observer_event(
-                    "scheduler.action_rejected",
-                    {"player_id": selected_id, "reason": type(error).__name__},
-                ),
-                *self._quiet_events([]),
-            ]
+        rule_events = self.rules.apply_action(action)
 
         self.action_count += 1
         self.action_counts[selected_id] = self.action_counts.get(selected_id, 0) + 1
@@ -306,6 +453,27 @@ class DiscussionScheduler:
             audience=Audience.observer(),
             payload=payload,
         )
+
+    @staticmethod
+    def _tool_error(player_id: str, error: IllegalAction) -> EventRecord:
+        return EventRecord(
+            phase="day.discussion",
+            type="tool.error",
+            actor=player_id,
+            audience=Audience.player(player_id),
+            payload={
+                "reason": type(error).__name__,
+                "correction_allowed": True,
+            },
+        )
+
+    async def _emit(self, events: Sequence[EventRecord]) -> None:
+        if self._event_sink is not None and events:
+            await self._event_sink(tuple(events))
+
+    async def _at_safe_point(self) -> None:
+        if self._safe_point is not None:
+            await self._safe_point()
 
 
 def _bounded_adjustment(probe: ReactionProbe) -> tuple[int, str]:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from clocktower.agents.context import project_context
+from clocktower.agents.context import is_safe_public_event, project_context
 from clocktower.domain.events import Audience, EventRecord
 from clocktower.domain.state import AttentionState, Notebook, NotebookAttention
 from tests.builders import sample_game_state
@@ -256,3 +256,17 @@ def test_explicit_public_event_requires_public_audience():
     malformed = event("player.public_message", Audience.player("alice"), payload={"text": "x"})
 
     assert project_context("alice", state, (malformed,)).events == ()
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    ["day.started", "day.discussion_resumed", "day.final_nomination_probe"],
+)
+def test_orchestrator_public_lifecycle_events_are_safe_player_context(event_type: str):
+    """Fail-closed classification must not make the orchestrator's day loop invisible."""
+
+    state = sample_game_state()
+    lifecycle = event(event_type, Audience.public(), payload={"day": state.day})
+
+    assert is_safe_public_event(lifecycle)
+    assert project_context("alice", state, (lifecycle,)).events == (lifecycle,)

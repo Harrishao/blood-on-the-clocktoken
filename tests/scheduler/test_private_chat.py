@@ -169,6 +169,48 @@ async def test_private_messages_are_visible_only_to_two_participants_and_public_
     assert scheduler.end_reason == "action_budget"
 
 
+async def test_orchestrator_sink_commits_private_transcript_once_at_each_causal_boundary():
+    """Batching a private transcript until scene end would reorder it after later model calls."""
+
+    markers: list[str] = []
+
+    async def event_sink(events):
+        markers.extend(f"event:{event.type}" for event in events)
+
+    scheduler, _state, agents = make_scheduler(
+        action_budget=1,
+        event_sink=event_sink,
+    )
+    original_invitation = agents["bob"].respond_private_invitation
+
+    async def invitation_with_marker(event):
+        markers.append("model:invitation")
+        return await original_invitation(event)
+
+    agents["bob"].respond_private_invitation = invitation_with_marker
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+    agents["alice"].actions = [
+        SpeakPrivate(actor="alice", chat_id=result.scene.chat_id, text="one committed body")
+    ]
+    original_action = agents["alice"].run_action
+
+    async def action_with_marker(scene):
+        markers.append("model:private")
+        return await original_action(scene)
+
+    agents["alice"].run_action = action_with_marker
+
+    returned = await scheduler.run(result.scene.chat_id)
+
+    assert markers.index("event:chat.private_invitation") < markers.index("model:invitation")
+    assert markers.index("event:chat.private_started") < markers.index("model:private")
+    assert markers.index("model:private") < markers.index("event:chat.private_message")
+    assert markers.index("event:chat.private_message") < markers.index("event:chat.private_ended")
+    assert markers.count("event:chat.private_message") == 1
+    assert sum(event.type == "chat.private_message" for event in returned) == 1
+
+
 async def test_private_candidates_and_normal_actions_are_limited_to_participants():
     """A third player must not be probed, prompted, or accepted inside the subscene."""
 
@@ -221,8 +263,9 @@ async def test_leave_stop_and_model_failure_end_and_clear_the_active_scene():
     result = await scheduler.request("alice", "bob")
     assert result.scene is not None
     agents["alice"].actions = [ModelCallError("normal unavailable"), ModelCallError("still unavailable")]
-    await scheduler.run(result.scene.chat_id)
-    assert scheduler.end_reason == "model_failed"
+    events = await scheduler.run(result.scene.chat_id)
+    assert scheduler.end_reason == "quiet"
+    assert any(event.type == "scheduler.normal_action_failed" for event in events)
     assert state.active_scene is None
 
     scheduler, state, _agents = make_scheduler()
@@ -511,6 +554,36 @@ async def test_stop_after_first_normal_model_failure_prevents_private_retry():
     await scheduler.run(result.scene.chat_id)
 
     assert len(agents["alice"].scenes) == 1
+    assert scheduler.end_reason == "stopped"
+
+
+async def test_owner_safe_point_runs_before_private_probe_model_retry():
+    """A pending Stop must be observed between failed short calls in a private scene."""
+
+    stop_requested = False
+
+    async def safe_point():
+        if stop_requested:
+            state.stopped = True
+
+    scheduler, state, agents = make_scheduler(safe_point=safe_point)
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+
+    class RequestStopOnProbeFailure(ScriptedPrivateAgent):
+        async def probe(self, event):
+            nonlocal stop_requested
+            self.probes.append(event)
+            stop_requested = True
+            raise ModelCallError("short unavailable")
+
+    agents["alice"] = RequestStopOnProbeFailure()
+    scheduler.agents = agents
+
+    await scheduler.run(result.scene.chat_id)
+
+    assert len(agents["alice"].probes) == 1
+    assert not agents["bob"].probes
     assert scheduler.end_reason == "stopped"
 
 

@@ -16,11 +16,22 @@ from clocktower.domain.actions import (
     UseAbility,
     YieldAction,
 )
+from clocktower.domain.events import Audience, EventRecord
 from clocktower.event_stream import EventStream
 from clocktower.history import HistoryWriteError, HistoryWriter
 from clocktower.models.protocol import ModelCallError
 from clocktower.orchestrator import GameOrchestrator
 from clocktower.rules.engine import RuleEngine
+
+
+def public_event(event_type: str) -> EventRecord:
+    return EventRecord(
+        phase="day.discussion",
+        type=event_type,
+        actor="alice",
+        audience=Audience.public(),
+        payload={},
+    )
 
 
 @dataclass
@@ -87,6 +98,11 @@ class ToggleHistoryWriter(HistoryWriter):
         if self.fail_writes:
             raise HistoryWriteError("disk unavailable")
         return await super().append(event)
+
+    async def append_many(self, events):
+        if self.fail_writes:
+            raise HistoryWriteError("disk unavailable")
+        return await super().append_many(events)
 
 
 def make_orchestrator(
@@ -446,6 +462,47 @@ async def test_history_failure_stops_before_rules_then_continue_retries_history_
             await task
 
 
+async def test_history_batch_failure_exposes_no_prefix_and_reloads_only_after_retry(tmp_path, monkeypatch):
+    agents = {
+        player_id: NightAgent(player_id)
+        for player_id in ("alice", "bob", "carol", "david", "eve")
+    }
+    orchestrator, _rules, history = make_orchestrator(tmp_path, agents)
+    writes = 0
+    write_line = history._write_line
+
+    def fail_second_line_once(*args) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("second event write failed")
+        write_line(*args)
+
+    monkeypatch.setattr(history, "_write_line", fail_second_line_once, raising=False)
+    batch = (
+        public_event("batch.first"),
+        public_event("batch.second"),
+    )
+    task = asyncio.create_task(orchestrator._commit_events(batch))
+
+    await asyncio.wait_for(orchestrator.wait_until_stopped(), timeout=1)
+    assert orchestrator.status().reason == "history_write_failed"
+    assert history.stream.after(0) == ()
+    assert history.path.read_text(encoding="utf-8") == ""
+
+    await orchestrator.continue_game()
+    committed = await asyncio.wait_for(task, timeout=1)
+
+    records = history.stream.after(0)
+    assert [event.type for event in records] == [
+        "batch.first",
+        "batch.second",
+        "model_config_reloaded",
+    ]
+    assert [event.seq for event in records] == [1, 2, 3]
+    assert committed == records[:2]
+
+
 async def test_stop_requested_during_history_pause_survives_recovery_until_next_safe_point(tmp_path):
     """History recovery cannot erase a later Stop; a second Continue is required to run models."""
 
@@ -491,10 +548,11 @@ async def test_stop_requested_during_history_pause_survives_recovery_until_next_
         assert reason_waiter in done
         assert not started.is_set()
         assert orchestrator.status().state == "stopped"
-        assert [event.type for event in history.stream.after(0)[:2]] == [
-            "game.header",
-            "model_config_reloaded",
+        recovered_records = history.stream.after(0)
+        assert [event.type for event in recovered_records[:-1]] == [
+            event.type for event in rules.events
         ]
+        assert recovered_records[-1].type == "model_config_reloaded"
 
         await orchestrator.continue_game()
         await asyncio.wait_for(started.wait(), timeout=1)

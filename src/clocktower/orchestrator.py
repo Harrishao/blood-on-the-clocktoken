@@ -644,21 +644,19 @@ class GameOrchestrator:
         self,
         events: Sequence[EventRecord],
     ) -> tuple[EventRecord, ...]:
-        committed: list[EventRecord] = []
-        for event in events:
-            recovering = False
-            while True:
-                try:
-                    record = await self.history.append(event)
-                except HistoryWriteError:
-                    recovering = True
-                    await self._wait_for_continue("history_write_failed")
-                    continue
-                committed.append(record)
-                break
-            if recovering:
-                await self._publish_reload_and_resume(clear_stop_requested=False)
-        return tuple(committed)
+        batch = tuple(events)
+        recovering = False
+        while True:
+            try:
+                committed = await self.history.append_many(batch)
+            except HistoryWriteError:
+                recovering = True
+                await self._wait_for_continue("history_write_failed")
+                continue
+            break
+        if recovering:
+            await self._publish_reload_and_resume(clear_stop_requested=False)
+        return committed
 
     async def _safe_point(self) -> None:
         if self.rules.check_winner() is not None:

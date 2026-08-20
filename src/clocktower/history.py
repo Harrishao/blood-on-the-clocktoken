@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, TextIO
 
@@ -59,12 +60,16 @@ class HistoryWriter:
         self._lock = asyncio.Lock()
 
     async def append(self, event: EventRecord) -> EventRecord:
+        records = await self.append_many((event,))
+        return records[0]
+
+    async def append_many(self, events: Sequence[EventRecord]) -> tuple[EventRecord, ...]:
+        batch = tuple(events)
         async with self._lock:
-            records = await self.stream.persist_and_publish(
-                lambda _first_seq: (event,),
+            return await self.stream.persist_and_publish(
+                lambda _first_seq: batch,
                 self._write_records,
             )
-            return records[0]
 
     async def update_notebook(self, state: GameState, player_id: str, notebook: Notebook) -> None:
         async with self._lock:

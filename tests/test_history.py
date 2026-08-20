@@ -59,6 +59,40 @@ async def test_append_reopens_utf8_jsonl_and_keeps_sequences_monotonic(tmp_path)
     assert stream.after(0) == (first, second)
 
 
+async def test_append_many_rolls_back_the_entire_batch_when_the_second_line_fails(
+    tmp_path,
+    monkeypatch,
+):
+    stream = EventStream()
+    history_path = tmp_path / "game.jsonl"
+    writer = HistoryWriter(history_path, stream)
+    writes = 0
+    write_line = writer._write_line
+
+    def fail_second_line_once(*args) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("second event write failed")
+        write_line(*args)
+
+    monkeypatch.setattr(writer, "_write_line", fail_second_line_once, raising=False)
+    batch = (public_event("batch.first"), public_event("batch.second"))
+
+    with pytest.raises(HistoryWriteError, match="could not write history"):
+        await writer.append_many(batch)
+
+    assert stream.after(0) == ()
+    assert stream.next_seq == 1
+    assert history_path.read_text(encoding="utf-8") == ""
+
+    committed = await writer.append_many(batch)
+
+    assert [event.type for event in committed] == ["batch.first", "batch.second"]
+    assert [event.seq for event in committed] == [1, 2]
+    assert stream.after(0) == committed
+
+
 async def test_write_failure_raises_without_publishing_the_event(tmp_path):
     target_directory = tmp_path / "history-directory"
     target_directory.mkdir()

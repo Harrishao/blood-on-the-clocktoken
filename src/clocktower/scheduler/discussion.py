@@ -21,6 +21,7 @@ from clocktower.domain.state import GameState
 from clocktower.rules.engine import RuleEngine
 from clocktower.models.protocol import ModelCallError
 
+from .contracts import validate_event_sink_result
 from .scoring import CandidateScore, ScoreContext, choose_candidate, score_candidates
 
 
@@ -598,13 +599,7 @@ class DiscussionScheduler:
         if self._event_sink is None or not drafts:
             return drafts
         result = await self._event_sink(drafts)
-        if (
-            isinstance(result, Sequence)
-            and len(result) == len(drafts)
-            and all(isinstance(event, EventRecord) for event in result)
-        ):
-            return tuple(result)
-        return drafts
+        return validate_event_sink_result(drafts, result)
 
     def _update_public_trigger(self, events: Sequence[EventRecord]) -> None:
         public_events = [event for event in events if is_safe_public_event(event)]

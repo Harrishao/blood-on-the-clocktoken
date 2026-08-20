@@ -13,6 +13,7 @@ from clocktower.domain.events import Audience, EventRecord
 from clocktower.domain.state import GameState
 from clocktower.models.protocol import ModelCallError
 
+from .contracts import validate_event_sink_result
 from .scoring import CandidateScore, FeatureContribution, choose_candidate
 
 
@@ -48,6 +49,8 @@ class PrivateChatScene:
     pending_scores: tuple[CandidateScore, ...] = ()
     pending_probe_index: int = 0
     pending_probe_adjustments: dict[str, int] = field(default_factory=dict)
+    pending_started_event: EventRecord | None = None
+    started_event: EventRecord | None = None
     pending_selection_event: EventRecord | None = None
     pending_action_commit: _PendingPrivateActionCommit | None = None
 
@@ -152,9 +155,12 @@ class PrivateChatScheduler:
                 )
 
             if pending.decision is None:
-                decision = await self._request_decision(pending.invitee, pending.invitation)
-                if decision == "accept" and not self._can_accept_after_wait(inviter, invitee):
+                if not self._can_accept_after_wait(inviter, invitee):
                     decision = "defer"
+                else:
+                    decision = await self._request_decision(pending.invitee, pending.invitation)
+                    if decision == "accept" and not self._can_accept_after_wait(inviter, invitee):
+                        decision = "defer"
                 pending.decision = decision
                 pending.response_draft = EventRecord(
                     phase="day.private_invite",
@@ -180,7 +186,17 @@ class PrivateChatScheduler:
             if self._state_provider().stopped:
                 result = PrivateChatRequest(
                     request_id=pending.request_id,
-                    decision="defer",
+                    decision=pending.decision,
+                    scene=None,
+                    events=(pending.invitation, pending.response),
+                )
+                self._pending_request = None
+                return result
+
+            if pending.scene is None and not self._can_accept_after_wait(inviter, invitee):
+                result = PrivateChatRequest(
+                    request_id=pending.request_id,
+                    decision=pending.decision,
                     scene=None,
                     events=(pending.invitation, pending.response),
                 )
@@ -200,6 +216,17 @@ class PrivateChatScheduler:
                 self.end_reason = None
                 self.probed_player_ids = ()
                 self.probe_adjustments = {}
+            elif not self._owns_reserved_request(pending.scene):
+                if self._scene is pending.scene:
+                    self._scene = None
+                result = PrivateChatRequest(
+                    request_id=pending.request_id,
+                    decision=pending.decision,
+                    scene=None,
+                    events=(pending.invitation, pending.response),
+                )
+                self._pending_request = None
+                return result
             await self._at_safe_point()
             result = PrivateChatRequest(
                 request_id=pending.request_id,
@@ -217,7 +244,18 @@ class PrivateChatScheduler:
             scene = self._scene
             if scene is None or scene.chat_id != chat_id:
                 raise ValueError("chat_id does not identify the active private scene")
+            events: list[EventRecord] = []
             state = self._state_provider()
+
+            if scene.pending_action_commit is not None:
+                if state.stopped:
+                    return events
+                committed_action = await self._emit(scene.pending_action_commit.events)
+                events.extend(committed_action)
+                self._finalize_pending_action(scene, committed_action)
+                await self._at_safe_point()
+                state = self._state_provider()
+
             if state.active_scene != chat_id or state.phase not in {
                 scene.parent_phase,
                 "day.private",
@@ -226,12 +264,10 @@ class PrivateChatScheduler:
                 ended = self._public_shell("chat.private_ended", scene)
                 committed = list(await self._emit((ended,)))
                 self._release_reservation(scene)
-                return committed
-            events: list[EventRecord] = []
-            if state.phase == scene.parent_phase:
-                state.phase = "day.private"
-                started = self._public_shell("chat.private_started", scene)
-                events.extend(await self._emit((started,)))
+                return events + committed
+            if scene.started_event is None:
+                committed_started = await self._commit_started(scene)
+                events.extend(committed_started)
                 await self._at_safe_point()
 
             while self.end_reason is None:
@@ -348,6 +384,44 @@ class PrivateChatScheduler:
             and invitee in state.players
             and inviter != invitee
         )
+
+    def _owns_reserved_request(self, scene: PrivateChatScene) -> bool:
+        state = self._state_provider()
+        return (
+            not state.stopped
+            and state.phase == "day.discussion"
+            and state.active_scene == scene.chat_id
+            and self._scene is scene
+            and all(player_id in state.players for player_id in scene.participant_ids)
+        )
+
+    async def _commit_started(self, scene: PrivateChatScene) -> tuple[EventRecord, ...]:
+        if scene.pending_started_event is None:
+            scene.pending_started_event = self._public_shell("chat.private_started", scene)
+        commit_task = asyncio.create_task(self._emit((scene.pending_started_event,)))
+        try:
+            committed = await asyncio.shield(commit_task)
+        except asyncio.CancelledError as cancelled:
+            committed = await commit_task
+            self._finalize_started(scene, committed)
+            raise cancelled
+        self._finalize_started(scene, committed)
+        return committed
+
+    def _finalize_started(
+        self,
+        scene: PrivateChatScene,
+        committed: tuple[EventRecord, ...],
+    ) -> None:
+        scene.started_event = committed[0]
+        scene.pending_started_event = None
+        state = self._state_provider()
+        if (
+            self._scene is scene
+            and state.active_scene == scene.chat_id
+            and state.phase == scene.parent_phase
+        ):
+            state.phase = "day.private"
 
     async def _request_decision(self, invitee: str, invitation: EventRecord) -> str:
         agent = self.agents.get(invitee)
@@ -870,13 +944,7 @@ class PrivateChatScheduler:
         if self._event_sink is None or not drafts:
             return drafts
         result = await self._event_sink(drafts)
-        if (
-            isinstance(result, Sequence)
-            and len(result) == len(drafts)
-            and all(isinstance(event, EventRecord) for event in result)
-        ):
-            return tuple(result)
-        return drafts
+        return validate_event_sink_result(drafts, result)
 
     @staticmethod
     def _append_committed_transcript(

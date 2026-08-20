@@ -1,6 +1,8 @@
 import asyncio
 from dataclasses import dataclass, field
 
+import pytest
+
 from clocktower.agents.player import AgentOutcome, ReactionProbe
 from clocktower.domain.actions import IllegalAction, Nominate, RequestPrivateChat, SpeakPublic, YieldAction
 from clocktower.domain.events import Audience, EventRecord
@@ -156,6 +158,7 @@ async def test_orchestrator_hooks_commit_scheduler_facts_before_dependent_calls_
 
     async def event_sink(events):
         markers.extend(f"event:{event.type}" for event in events)
+        return tuple(events)
 
     safe_points = 0
 
@@ -269,6 +272,32 @@ async def test_public_action_sink_failure_retries_exact_batch_without_replaying_
         "player.public_message",
         "scheduler.ended",
     ]
+
+
+async def test_partial_public_action_sink_result_preserves_the_pending_checkpoint():
+    """A partial sink result is not a commit and cannot advance scheduler state."""
+
+    action_attempts = 0
+
+    async def event_sink(events):
+        nonlocal action_attempts
+        batch = tuple(events)
+        if any(event.type == "player.public_message" for event in batch):
+            action_attempts += 1
+            return batch[:-1]
+        return batch
+
+    scheduler, agents, rules = make_scheduler(action_budget=1, event_sink=event_sink)
+
+    with pytest.raises(RuntimeError, match="event sink returned 1 records for 2 events"):
+        await scheduler.step()
+
+    assert action_attempts == 1
+    assert sum(len(agent.scenes) for agent in agents.values()) == 1
+    assert len(rules.actions) == 1
+    assert scheduler.action_count == 0
+    assert scheduler.end_reason is None
+    assert scheduler.pending_action_commit is not None
 
 
 async def test_stop_arriving_during_ranking_sink_prevents_any_probe():

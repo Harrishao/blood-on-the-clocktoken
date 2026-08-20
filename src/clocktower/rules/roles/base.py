@@ -18,12 +18,31 @@ class AbilityContext:
 
     state: GameState
     actor_id: str
+    nominator_id: str | None = None
+    nominee_id: str | None = None
 
     @classmethod
     def from_state(cls, state: GameState, actor_id: str) -> AbilityContext:
         if actor_id not in state.players:
             raise ValueError(f"unknown ability actor: {actor_id}")
         return cls(state=state, actor_id=actor_id)
+
+    @classmethod
+    def for_nomination(
+        cls, state: GameState, *, nominator: str, nominee: str
+    ) -> AbilityContext:
+        """Build a read-only context for a nominee's nomination trigger."""
+
+        if nominator not in state.players:
+            raise ValueError(f"unknown nominator: {nominator}")
+        if nominee not in state.players:
+            raise ValueError(f"unknown nominee: {nominee}")
+        return cls(
+            state=state,
+            actor_id=nominee,
+            nominator_id=nominator,
+            nominee_id=nominee,
+        )
 
     @property
     def actor(self) -> PlayerState:
@@ -34,6 +53,12 @@ class AbilityContext:
         """Whether the actor may receive a legal false information result."""
 
         return self.actor.role == "drunk" or "poisoned" in self.actor.reminders
+
+    @property
+    def is_healthy(self) -> bool:
+        """Whether an ability can produce an effect at this decision point."""
+
+        return self.actor.alive and not self.is_misinformed
 
 
 @dataclass(frozen=True, slots=True)

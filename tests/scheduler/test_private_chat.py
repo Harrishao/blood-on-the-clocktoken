@@ -385,6 +385,132 @@ async def test_invitation_commit_revalidates_before_starting_the_invitee_model()
     assert scheduler._scene is None
 
 
+@pytest.mark.parametrize("first_result", ["model_error", "fallback"])
+@pytest.mark.parametrize("takeover", ["night", "external"])
+async def test_invitation_retry_requires_complete_current_ownership(first_result: str, takeover: str):
+    """A failed or malformed first short call cannot retry after day ownership is lost."""
+
+    scheduler, state, agents = make_scheduler()
+
+    class TakeOverOnFirstInvitation(ScriptedPrivateAgent):
+        async def respond_private_invitation(self, invitation):
+            self.invitations.append(invitation)
+            if takeover == "night":
+                state.phase = "night"
+            else:
+                state.active_scene = "external-scene"
+            if first_result == "model_error":
+                raise ModelCallError("short unavailable")
+            return PrivateInvitationResponse.fallback_defer()
+
+    agents["bob"] = TakeOverOnFirstInvitation()
+    scheduler.agents = agents
+
+    result = await scheduler.request("alice", "bob")
+
+    assert result.decision == "defer"
+    assert result.scene is None
+    assert len(agents["bob"].invitations) == 1
+    assert state.phase == ("night" if takeover == "night" else "day.discussion")
+    assert state.active_scene == ("external-scene" if takeover == "external" else None)
+    assert scheduler._scene is None
+    assert scheduler._pending_request is None
+
+
+@pytest.mark.parametrize("takeover", ["night", "external", "stopped"])
+async def test_final_invitation_safe_point_revalidates_and_releases_only_its_reservation(takeover: str):
+    """A final safe-point takeover invalidates the accepted scene without touching external state."""
+
+    safe_points = 0
+
+    async def safe_point():
+        nonlocal safe_points
+        safe_points += 1
+        if safe_points != 3:
+            return
+        if takeover == "night":
+            state.phase = "night"
+        elif takeover == "external":
+            state.active_scene = "external-scene"
+        else:
+            state.stopped = True
+
+    scheduler, state, _agents = make_scheduler(safe_point=safe_point)
+
+    result = await scheduler.request("alice", "bob")
+
+    assert result.decision == "accept"
+    assert result.scene is None
+    assert [event.type for event in result.events] == [
+        "chat.private_invitation",
+        "chat.private_response",
+    ]
+    assert scheduler._pending_request is None
+    assert scheduler._scene is None
+    if takeover == "external":
+        assert state.phase == "day.discussion"
+        assert state.active_scene == "external-scene"
+    elif takeover == "night":
+        assert state.phase == "night"
+        assert state.active_scene is None
+    else:
+        assert state.stopped is True
+        assert state.phase == "day.discussion"
+        assert state.active_scene is None
+
+
+@pytest.mark.parametrize("takeover", ["owned", "external"])
+async def test_cancelled_final_invitation_safe_point_cleans_reservation_on_stopped_reentry(takeover: str):
+    """Cancelled accepted requests retain their stage, then stopped reentry cleans only local ownership."""
+
+    final_safe_started = asyncio.Event()
+    safe_points = 0
+
+    async def safe_point():
+        nonlocal safe_points
+        safe_points += 1
+        if safe_points == 3:
+            final_safe_started.set()
+            await asyncio.Event().wait()
+
+    scheduler, state, agents = make_scheduler(safe_point=safe_point)
+    task = asyncio.create_task(scheduler.request("alice", "bob"))
+    await asyncio.wait_for(final_safe_started.wait(), timeout=1)
+    reserved_chat_id = state.active_scene
+    assert reserved_chat_id is not None
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert scheduler._pending_request is not None
+    assert scheduler._scene is not None
+    assert len(agents["bob"].invitations) == 1
+
+    state.stopped = True
+    if takeover == "external":
+        state.active_scene = "external-scene"
+
+    recovered = await scheduler.request("alice", "bob")
+
+    assert safe_points == 3
+    assert recovered.decision == "accept"
+    assert recovered.scene is None
+    assert [event.type for event in recovered.events] == [
+        "chat.private_invitation",
+        "chat.private_response",
+    ]
+    assert len(agents["bob"].invitations) == 1
+    assert scheduler._pending_request is None
+    assert scheduler._scene is None
+    if takeover == "external":
+        assert state.phase == "day.discussion"
+        assert state.active_scene == "external-scene"
+    else:
+        assert state.phase == "day.discussion"
+        assert state.active_scene is None
+
+
 async def test_failed_private_action_is_committed_before_external_ownership_loss():
     """An already-executed action stays reachable even if another owner advances the phase."""
 

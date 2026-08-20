@@ -141,25 +141,21 @@ class PrivateChatScheduler:
                 self._pending_request = pending
             elif (pending.inviter, pending.invitee) != (inviter, invitee):
                 raise ValueError("another private-chat request is awaiting recovery")
+            if state.stopped:
+                return self._abort_pending_request(pending)
 
             if pending.invitation is None:
                 pending.invitation = (await self._emit((pending.invitation_draft,)))[0]
             await self._at_safe_point()
             if self._state_provider().stopped:
-                self._pending_request = None
-                return PrivateChatRequest(
-                    request_id=pending.request_id,
-                    decision="defer",
-                    scene=None,
-                    events=(pending.invitation,),
-                )
+                return self._abort_pending_request(pending)
 
             if pending.decision is None:
-                if not self._can_accept_after_wait(inviter, invitee):
+                if not self._invitation_ownership_valid(pending):
                     decision = "defer"
                 else:
-                    decision = await self._request_decision(pending.invitee, pending.invitation)
-                    if decision == "accept" and not self._can_accept_after_wait(inviter, invitee):
+                    decision = await self._request_decision(pending)
+                    if decision == "accept" and not self._invitation_ownership_valid(pending):
                         decision = "defer"
                 pending.decision = decision
                 pending.response_draft = EventRecord(
@@ -175,33 +171,10 @@ class PrivateChatScheduler:
                 pending.response = (await self._emit((pending.response_draft,)))[0]
             await self._at_safe_point()
             if pending.decision != "accept":
-                result = PrivateChatRequest(
-                    request_id=pending.request_id,
-                    decision=pending.decision,
-                    scene=None,
-                    events=(pending.invitation, pending.response),
-                )
-                self._pending_request = None
-                return result
-            if self._state_provider().stopped:
-                result = PrivateChatRequest(
-                    request_id=pending.request_id,
-                    decision=pending.decision,
-                    scene=None,
-                    events=(pending.invitation, pending.response),
-                )
-                self._pending_request = None
-                return result
+                return self._abort_pending_request(pending)
 
-            if pending.scene is None and not self._can_accept_after_wait(inviter, invitee):
-                result = PrivateChatRequest(
-                    request_id=pending.request_id,
-                    decision=pending.decision,
-                    scene=None,
-                    events=(pending.invitation, pending.response),
-                )
-                self._pending_request = None
-                return result
+            if not self._invitation_ownership_valid(pending):
+                return self._abort_pending_request(pending)
 
             if pending.scene is None:
                 accepted_state = self._state_provider()
@@ -216,18 +189,9 @@ class PrivateChatScheduler:
                 self.end_reason = None
                 self.probed_player_ids = ()
                 self.probe_adjustments = {}
-            elif not self._owns_reserved_request(pending.scene):
-                if self._scene is pending.scene:
-                    self._scene = None
-                result = PrivateChatRequest(
-                    request_id=pending.request_id,
-                    decision=pending.decision,
-                    scene=None,
-                    events=(pending.invitation, pending.response),
-                )
-                self._pending_request = None
-                return result
             await self._at_safe_point()
+            if not self._invitation_ownership_valid(pending):
+                return self._abort_pending_request(pending)
             result = PrivateChatRequest(
                 request_id=pending.request_id,
                 decision=pending.decision,
@@ -373,27 +337,44 @@ class PrivateChatScheduler:
         if state.active_scene is not None or self._scene is not None:
             raise ValueError("another scene is already active")
 
-    def _can_accept_after_wait(self, inviter: str, invitee: str) -> bool:
+    def _invitation_ownership_valid(self, pending: _PendingPrivateRequest) -> bool:
         state = self._state_provider()
-        return (
+        common = (
             not state.stopped
             and state.phase == "day.discussion"
-            and state.active_scene is None
-            and self._scene is None
-            and inviter in state.players
-            and invitee in state.players
-            and inviter != invitee
+            and pending.inviter in state.players
+            and pending.invitee in state.players
+            and pending.inviter != pending.invitee
+        )
+        if not common:
+            return False
+        if pending.scene is None:
+            return state.active_scene is None and self._scene is None
+        return (
+            state.active_scene == pending.scene.chat_id
+            and self._scene is pending.scene
         )
 
-    def _owns_reserved_request(self, scene: PrivateChatScene) -> bool:
+    def _abort_pending_request(self, pending: _PendingPrivateRequest) -> PrivateChatRequest:
+        scene = pending.scene
         state = self._state_provider()
-        return (
-            not state.stopped
-            and state.phase == "day.discussion"
-            and state.active_scene == scene.chat_id
-            and self._scene is scene
-            and all(player_id in state.players for player_id in scene.participant_ids)
+        if scene is not None and self._scene is scene:
+            self._scene = None
+            if state.active_scene == scene.chat_id:
+                state.active_scene = None
+        events = tuple(
+            event
+            for event in (pending.invitation, pending.response)
+            if event is not None
         )
+        result = PrivateChatRequest(
+            request_id=pending.request_id,
+            decision=pending.decision or "defer",
+            scene=None,
+            events=events,
+        )
+        self._pending_request = None
+        return result
 
     async def _commit_started(self, scene: PrivateChatScene) -> tuple[EventRecord, ...]:
         if scene.pending_started_event is None:
@@ -423,31 +404,29 @@ class PrivateChatScheduler:
         ):
             state.phase = "day.private"
 
-    async def _request_decision(self, invitee: str, invitation: EventRecord) -> str:
-        agent = self.agents.get(invitee)
+    async def _request_decision(self, pending: _PendingPrivateRequest) -> str:
+        agent = self.agents.get(pending.invitee)
         if agent is None:
             return "defer"
         for attempt in range(2):
-            if self._state_provider().stopped:
+            if not self._invitation_ownership_valid(pending):
                 return "defer"
             try:
-                response = await agent.respond_private_invitation(invitation)  # type: ignore[attr-defined]
+                response = await agent.respond_private_invitation(pending.invitation)  # type: ignore[attr-defined]
             except ModelCallError:
-                if self._state_provider().stopped or attempt == 1:
+                if attempt == 1:
                     return "defer"
                 await self._at_safe_point()
-                if self._state_provider().stopped:
+                if not self._invitation_ownership_valid(pending):
                     return "defer"
                 continue
             decision = getattr(response, "decision", response)
             if decision in {"accept", "reject", "defer"} and not getattr(response, "fallback", False):
                 return str(decision)
-            if self._state_provider().stopped:
-                return "defer"
             if attempt == 1:
                 return "defer"
             await self._at_safe_point()
-            if self._state_provider().stopped:
+            if not self._invitation_ownership_valid(pending):
                 return "defer"
         return "defer"
 

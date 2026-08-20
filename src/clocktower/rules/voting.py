@@ -72,7 +72,17 @@ class NominationTracker:
         self._nominees: set[str] = set()
         self._nominations: dict[str, _OpenNomination] = {}
         self._tallies: dict[str, int] = {}
+        self._qualifying_nominees: set[str] = set()
         self._active_nomination_id: str | None = None
+
+    def update_alive_count(self, alive_count: int) -> None:
+        """Use the current living count for the next nomination's vote threshold."""
+
+        if alive_count <= 0:
+            raise ValueError("alive_count must be positive")
+        if self._active_nomination_id is not None:
+            raise IllegalAction("cannot change alive count during an active nomination")
+        self.alive_count = alive_count
 
     def nominate(
         self,
@@ -139,6 +149,10 @@ class NominationTracker:
         if votes < 0:
             raise ValueError("votes cannot be negative")
         self._tallies[nominee] = votes
+        if qualifying_tally(votes, self.alive_count):
+            self._qualifying_nominees.add(nominee)
+        else:
+            self._qualifying_nominees.discard(nominee)
 
     def tally_for(self, nomination_id: str) -> int:
         """Return the current tally for a recorded nomination."""
@@ -152,13 +166,26 @@ class NominationTracker:
         qualifying = {
             nominee: votes
             for nominee, votes in self._tallies.items()
-            if qualifying_tally(votes, self.alive_count)
+            if nominee in self._qualifying_nominees
         }
         if not qualifying:
             return None
         highest_votes = max(qualifying.values())
         highest = [nominee for nominee, votes in qualifying.items() if votes == highest_votes]
         return highest[0] if len(highest) == 1 else None
+
+    @property
+    def active_nomination_id(self) -> str | None:
+        return self._active_nomination_id
+
+    @property
+    def current_vote_order(self) -> tuple[str, ...]:
+        if self._active_nomination_id is None:
+            return ()
+        return self._nominations[self._active_nomination_id].nomination.vote_order
+
+    def votes_for(self, nomination_id: str) -> tuple[VoteRecord, ...]:
+        return tuple(self._open_nomination_or_complete(nomination_id).votes)
 
     def _open_nomination(self, nomination_id: str) -> _OpenNomination:
         if nomination_id != self._active_nomination_id:

@@ -35,6 +35,20 @@ class RoleState(BaseModel):
     """Mutable role-specific state; role handlers extend this contract later."""
 
     fortune_teller_red_herring: str | None = None
+    poisoned_player_id: str | None = None
+    poisoned_by_player_id: str | None = None
+    protected_player_id: str | None = None
+    protected_by_player_id: str | None = None
+    butler_masters: dict[str, str] = Field(default_factory=dict)
+    executed_today: str | None = None
+    night_deaths: list[str] = Field(default_factory=list)
+    first_night: bool = True
+    night_step_index: int = 0
+    pending_night_role: str | None = None
+    pending_night_actor_id: str | None = None
+    winner: str | None = None
+    winner_reason: str | None = None
+    game_ended: bool = False
 
 
 class GameState(BaseModel):

@@ -88,19 +88,19 @@ export const checkpointFixture: EventRecord = {
     latest_event_seq: 8,
     players: {
       alice: {
-        player_id: "alice", seat: 0, role: "washerwoman", perceived_identity: "washerwoman",
+        player_id: "alice", seat: 0, role: "drunk", perceived_identity: "librarian",
         alignment: "good", known_alignment: "good", alive: true, dead_vote_available: true,
-        notebook: { notes: "Bob may be the Chef.", attention: { players: ["bob"], pending_actions: [], watch_triggers: [] } },
-        perceived_ability_text: "", reminders: [],
+        notebook: { notes: "Bob may be the Chef.", attention: { players: ["bob"], pending_actions: ["request_private_chat"], watch_triggers: ["claim.public"] } },
+        perceived_ability_text: "You start knowing that one of two players is a particular Outsider.", reminders: ["is_drunk"],
       },
       bob: {
         player_id: "bob", seat: 1, role: "poisoner", perceived_identity: "poisoner",
-        alignment: "evil", known_alignment: "evil", alive: true, dead_vote_available: true,
-        notebook: { notes: "Alice is probing me.", attention: { players: ["alice"], pending_actions: [], watch_triggers: [] } },
-        perceived_ability_text: "", reminders: ["poisoned"],
+        alignment: "evil", known_alignment: "evil", alive: false, dead_vote_available: false,
+        notebook: { notes: "Alice is probing me.", attention: { players: ["alice"], pending_actions: ["nominate"], watch_triggers: ["vote.cast"] } },
+        perceived_ability_text: "Each night, choose a player: they are poisoned tonight and tomorrow day.", reminders: ["poisoned", "dead_vote_spent"],
       },
     },
-    role_state: { poisoned_player_id: "alice", game_ended: false },
+    role_state: { poisoned_player_id: "alice", protected_player_id: "eve", game_ended: false },
   },
 }
 

@@ -7,7 +7,14 @@ import type { EventFilter, EventRecord, RuntimeStatus } from "./types"
 
 type Mode = { kind: "live" } | { kind: "history"; name: string; events: EventRecord[] }
 type ViewerError = { message: string; liveOnly: boolean }
-export type LiveConnector = (afterSeq: number, onEvent: (event: EventRecord) => void) => () => void
+export type LiveConnector = (
+  afterSeq: number,
+  onEvent: (event: EventRecord) => void,
+  onGenerationReset: () => void,
+) => () => void
+
+const connectAppLive: LiveConnector = (afterSeq, onEvent, onGenerationReset) =>
+  connectLive(afterSeq, onEvent, { onGenerationReset })
 
 const defaultFetchRuntime = async (): Promise<RuntimeStatus> => {
   const response = await fetch("/api/state")
@@ -20,7 +27,7 @@ const defaultSendControl = async (action: "stop" | "continue") => {
   if (!response.ok) throw new Error(`${action} request failed (${response.status})`)
 }
 
-export function App({ connect = connectLive, fetchRuntime = defaultFetchRuntime, sendControl = defaultSendControl }: {
+export function App({ connect = connectAppLive, fetchRuntime = defaultFetchRuntime, sendControl = defaultSendControl }: {
   connect?: LiveConnector
   fetchRuntime?: () => Promise<RuntimeStatus>
   sendControl?: (action: "stop" | "continue") => Promise<unknown>
@@ -32,11 +39,17 @@ export function App({ connect = connectLive, fetchRuntime = defaultFetchRuntime,
   const [selectedCheckpoint, setSelectedCheckpoint] = useState<EventRecord | null>(null)
   const [error, setError] = useState<ViewerError | null>(null)
   const lastSeq = useRef(0)
+  const modeRef = useRef(mode)
+  modeRef.current = mode
 
   useEffect(() => connect(lastSeq.current, (event) => {
     if (event.seq <= lastSeq.current) return
     lastSeq.current = event.seq
     setLiveEvents((current) => [...current, event])
+  }, () => {
+    lastSeq.current = 0
+    setLiveEvents([])
+    if (modeRef.current.kind === "live") setSelectedCheckpoint(null)
   }), [connect])
 
   useEffect(() => {

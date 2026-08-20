@@ -26,7 +26,17 @@ export function CheckpointPanel({ checkpoint, onClose, onLocate }: { checkpoint:
     <section><label htmlFor="checkpoint-player">Player notebook</label><select id="checkpoint-player" value={player?.player_id} onChange={(event) => setPlayerId(event.target.value)}>
       {orderedPlayers.map((item) => <option key={item.player_id} value={item.player_id}>{titleCase(item.player_id)} notebook</option>)}
     </select>
-    <div className="notebook"><pre>{player?.notebook.notes || "No notes."}</pre><div className="attention-row"><span>Watching: {player?.notebook.attention.players.join(", ") || "none"}</span><span>Pending: {player?.notebook.attention.pending_actions.join(", ") || "none"}</span></div></div></section>
+    {player && <div className="selected-player-details" aria-label="Selected player state">
+      <span>Actual role: {titleCase(player.role)}</span>
+      <span>Perceived identity: {titleCase(player.perceived_identity)}</span>
+      <span>Alignment: {player.alignment}</span>
+      <span>Known alignment: {player.known_alignment}</span>
+      <span>Life: {player.alive ? "alive" : "dead"}</span>
+      <span>Dead vote: {player.dead_vote_available ? "available" : "spent"}</span>
+      <span>Perceived ability: {player.perceived_ability_text || "None"}</span>
+      <span>Reminders: {player.reminders.map((reminder) => reminder.replaceAll("_", " ")).join(", ") || "none"}</span>
+    </div>}
+    <div className="notebook"><pre>{player?.notebook.notes || "No notes."}</pre><div className="attention-row"><span>Watching: {player?.notebook.attention.players.join(", ") || "none"}</span><span>Pending: {player?.notebook.attention.pending_actions.join(", ") || "none"}</span><span>Triggers: {player?.notebook.attention.watch_triggers.join(", ") || "none"}</span></div></div></section>
     <section><h3>Role state</h3><pre className="role-state">{JSON.stringify(snapshot.role_state, null, 2)}</pre></section>
     <button className="locate-button" onClick={() => onLocate(snapshot.trigger_event_seq)}>Locate event {snapshot.trigger_event_seq}</button>
   </aside>

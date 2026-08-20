@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { CheckpointPanel } from "./components/CheckpointPanel"
 import { EventStream } from "./components/EventStream"
+import { Toolbar } from "./components/Toolbar"
 import { parseHistory } from "./lib/history"
 import { connectLive } from "./lib/live"
 import type { EventFilter, EventRecord, RuntimeStatus } from "./types"
@@ -91,19 +92,16 @@ export function App({ connect = connectAppLive, fetchRuntime = defaultFetchRunti
 
   return <main className={`app ${selectedCheckpoint ? "with-panel" : ""}`}>
     <section className="conversation-pane">
-      <header className="topbar">
-        <div className="brand"><span className="brand-mark">CT</span><div><h1>Clocktower Observer</h1><p>Autonomous Trouble Brewing</p></div></div>
-        <div className="session-status">
-          <span className={`status-dot ${runtime?.state ?? "ready"}`} />
-          <div><strong>{mode.kind === "live" ? `Live · ${runtime?.state ?? "connecting"}` : `History · ${mode.name}`}</strong><small>{mode.kind === "live" ? `Day ${runtime?.day ?? "–"} · ${runtime?.phase ?? "waiting"}` : `${events.length} events · ${checkpoints} checkpoints`}</small></div>
-        </div>
-        <div className="controls">
-          <label className="file-button">Open history<input aria-label="Open history" type="file" accept=".jsonl,application/x-ndjson" onChange={(event) => void openHistory(event.target.files?.[0])} /></label>
-          {mode.kind === "history" && <button onClick={() => { setMode({ kind: "live" }); setSelectedCheckpoint(null) }}>Back to live</button>}
-          {mode.kind === "live" && runtime?.state === "running" && <button className="control-primary" onClick={() => void control("stop")}>Stop</button>}
-          {mode.kind === "live" && runtime?.state === "stopped" && <button className="control-primary" onClick={() => void control("continue")}>Continue</button>}
-        </div>
-      </header>
+      <Toolbar
+        mode={mode.kind}
+        runtime={runtime?.state ?? "connecting"}
+        statusTitle={mode.kind === "live" ? `Live · ${runtime?.state ?? "connecting"}` : `History · ${mode.name}`}
+        statusDetail={mode.kind === "live" ? `Day ${runtime?.day ?? "–"} · ${runtime?.phase ?? "waiting"}` : `${events.length} events · ${checkpoints} checkpoints`}
+        onOpenHistory={(file) => void openHistory(file)}
+        onBackToLive={() => { setMode({ kind: "live" }); setSelectedCheckpoint(null) }}
+        onStop={() => void control("stop")}
+        onContinue={() => void control("continue")}
+      />
       <nav className="filterbar" aria-label="Event filters">
         {(["all", "text", "reasoning", "tools", "rules"] as EventFilter[]).map((item) => <button key={item} aria-pressed={filter === item} onClick={() => setFilter(item)}>{item}</button>)}
       </nav>

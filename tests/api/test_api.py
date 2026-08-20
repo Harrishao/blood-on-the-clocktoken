@@ -218,3 +218,29 @@ def test_lifespan_owns_one_orchestrator_task_and_static_assets_are_optional(
         assert orchestrator.started == 1
 
     assert orchestrator.cancelled == 1
+
+
+def test_static_spa_never_claims_an_unsupported_api_control_route(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Mounting the built SPA at / must not turn an absent API route into static 405."""
+
+    from clocktower import main
+
+    class FixtureRuntime(ControllableOrchestrator):
+        async def run(self) -> None:
+            await asyncio.Event().wait()
+
+    orchestrator = FixtureRuntime()
+    stream = EventStream()
+    monkeypatch.setattr(main, "build_runtime", lambda _path: (orchestrator, stream))
+    web_dist = tmp_path / "dist"
+    web_dist.mkdir()
+    (web_dist / "index.html").write_text("<main>observer</main>", encoding="utf-8")
+    app = main.create_application(config_path=tmp_path / "config.toml", web_dist=web_dist)
+
+    with TestClient(app) as client:
+        assert client.get("/").status_code == 200
+        assert client.get("/api/state").status_code == 200
+        assert client.post("/api/control/step").status_code == 404

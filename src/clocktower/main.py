@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 
 from clocktower.agents.player import PlayerAgent
@@ -86,6 +86,15 @@ def create_application(
     application = FastAPI(lifespan=lifespan)
     application.include_router(router)
     if web_dist.is_dir():
+        @application.api_route(
+            "/api/{unsupported_path:path}",
+            methods=("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"),
+            include_in_schema=False,
+        )
+        async def unsupported_api_route(unsupported_path: str) -> None:
+            del unsupported_path
+            raise HTTPException(status_code=404, detail="Not Found")
+
         application.mount("/", StaticFiles(directory=web_dist, html=True), name="web")
     return application
 

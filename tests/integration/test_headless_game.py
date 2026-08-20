@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from collections.abc import Callable
 
-from clocktower.agents.player import AgentOutcome, ReactionProbe
+from clocktower.agents.context import project_context
+from clocktower.agents.player import AgentOutcome, ReactionProbe, segment_event
 from clocktower.config import GameConfig
 from clocktower.domain.actions import (
     CastVote,
@@ -17,6 +19,7 @@ from clocktower.domain.actions import (
 )
 from clocktower.event_stream import EventStream
 from clocktower.history import HistoryWriter
+from clocktower.models.protocol import ModelSegment
 from clocktower.orchestrator import GameOrchestrator
 from clocktower.rules.engine import RuleEngine
 
@@ -28,6 +31,53 @@ class GameScript:
     nomination_submitted: bool = False
     final_probe_player_ids: list[str] = field(default_factory=list)
     vote_observations: list[tuple[str, int]] = field(default_factory=list)
+    notebook_updated: bool = False
+    prompt_event_seqs: dict[str, set[int]] = field(default_factory=dict)
+
+
+@dataclass
+class CompleteGameFakeProvider:
+    """Deterministic no-network provider trace used by the complete-game acceptance path."""
+
+    call_count: int = 0
+
+    async def record_call(
+        self,
+        history: HistoryWriter,
+        *,
+        player_id: str,
+        purpose: str,
+        phase: str,
+    ) -> None:
+        self.call_count += 1
+        call_id = f"fake-{self.call_count}-{player_id}-{purpose}"
+        specifications = (
+            ("reasoning", "reasoning_content", "Consider the visible facts."),
+            ("reasoning", "thinking", "Choose one bounded action."),
+            ("tool_call", "tool_calls", '{"scripted":true}'),
+            ("tool_result", "tool_result", '{"ok":true}'),
+            ("final_message", "content", "Scripted provider turn complete."),
+        )
+        events = tuple(
+            segment_event(
+                player_id,
+                purpose,
+                ModelSegment(
+                    call_id=call_id,
+                    index=index,
+                    kind=kind,
+                    source_field=source_field,
+                    text=text,
+                    tool_index=0 if kind in {"tool_call", "tool_result"} else None,
+                    tool_call_id="fake-tool" if kind in {"tool_call", "tool_result"} else None,
+                    tool_name="scripted_decision" if kind in {"tool_call", "tool_result"} else None,
+                    tool_type="function" if kind in {"tool_call", "tool_result"} else None,
+                ),
+                phase,
+            )
+            for index, (kind, source_field, text) in enumerate(specifications)
+        )
+        await history.append_many(events)
 
 
 @dataclass
@@ -35,11 +85,32 @@ class CompleteGameAgent:
     player_id: str
     script: GameScript
     history: HistoryWriter | None = None
+    state_provider: Callable | None = None
+    provider: CompleteGameFakeProvider | None = None
+
+    async def _record_provider_turn(self, purpose: str, *, trigger=None) -> None:
+        assert self.history is not None
+        assert self.state_provider is not None
+        assert self.provider is not None
+        state = self.state_provider()
+        source = (trigger,) if trigger is not None else tuple(self.history.stream.after(0))
+        context = project_context(self.player_id, state, source)
+        self.script.prompt_event_seqs.setdefault(self.player_id, set()).update(
+            event.seq for event in context.events if event.seq > 0
+        )
+        await self.provider.record_call(
+            self.history,
+            player_id=self.player_id,
+            purpose=purpose,
+            phase=trigger.phase if trigger is not None else state.phase,
+        )
 
     async def respond_private_invitation(self, invitation):
+        await self._record_provider_turn("private_invitation_response", trigger=invitation)
         return "accept"
 
     async def probe(self, event):
+        await self._record_provider_turn("reaction_probe", trigger=event)
         if event.type == "day.final_nomination_probe":
             self.script.final_probe_player_ids.append(self.player_id)
             return ReactionProbe(decision="silent", urgency=0, action_type="yield")
@@ -52,6 +123,15 @@ class CompleteGameAgent:
         return ReactionProbe(decision="silent", urgency=0, action_type="yield")
 
     async def run_action(self, scene):
+        await self._record_provider_turn(scene.purpose)
+        if self.player_id == "alice" and not self.script.notebook_updated:
+            assert self.history is not None
+            assert self.state_provider is not None
+            state = self.state_provider()
+            notebook = state.players[self.player_id].notebook.model_copy(deep=True)
+            notebook.notes = "Track claims and revisit the private conversation."
+            await self.history.update_notebook(state, self.player_id, notebook)
+            self.script.notebook_updated = True
         if scene.purpose == "night_ability":
             return AgentOutcome(
                 action=UseAbility(
@@ -134,12 +214,15 @@ async def run_complete_game(path):
     rules = RuleEngine.start_game(player_ids, seed=17)
     history = HistoryWriter(path, EventStream())
     script = GameScript()
+    provider = CompleteGameFakeProvider()
     agents = {
         player_id: CompleteGameAgent(player_id, script)
         for player_id in player_ids
     }
     for agent in agents.values():
         agent.history = history
+        agent.state_provider = lambda: rules.state
+        agent.provider = provider
     orchestrator = GameOrchestrator(
         rules=rules,
         agents=agents,

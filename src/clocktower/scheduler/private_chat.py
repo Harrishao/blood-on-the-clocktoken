@@ -128,10 +128,14 @@ class PrivateChatScheduler:
         """Run the accepted subscene to one of its bounded termination conditions."""
 
         async with self._lock:
-            scene = self._active_scene(chat_id)
+            scene = self._scene
+            if scene is None or scene.chat_id != chat_id:
+                raise ValueError("chat_id does not identify the active private scene")
             state = self._state_provider()
-            if state.phase != scene.parent_phase:
-                raise ValueError("private scene no longer owns the current phase")
+            if state.active_scene != chat_id or state.phase != scene.parent_phase:
+                self._end(scene, "ownership_lost")
+                self._release_reservation(scene)
+                return [self._public_shell("chat.private_ended", scene)]
             state.phase = "day.private"
             events: list[EventRecord] = [self._public_shell("chat.private_started", scene)]
             try:
@@ -155,6 +159,9 @@ class PrivateChatScheduler:
                     events.append(self._ranking_event(scene, scores))
                     adjusted, probe_events = await self._probe_top_two(scene, scores)
                     events.extend(probe_events)
+                    if not self._owns(scene):
+                        self._end(scene, "ownership_lost")
+                        break
                     if self._state_provider().stopped:
                         events.append(self._observer_event("scheduler.stopped", scene))
                         self._end(scene, "stopped")
@@ -170,7 +177,7 @@ class PrivateChatScheduler:
             finally:
                 if self.end_reason is None:
                     self._end(scene, "model_failed")
-                self._clear_active_scene(scene)
+                self._release_reservation(scene)
                 events.append(self._public_shell("chat.private_ended", scene))
             return events
 
@@ -219,12 +226,6 @@ class PrivateChatScheduler:
             if attempt == 1:
                 return "defer"
         return "defer"
-
-    def _active_scene(self, chat_id: str) -> PrivateChatScene:
-        scene = self._scene
-        if scene is None or scene.chat_id != chat_id or self._state_provider().active_scene != chat_id:
-            raise ValueError("chat_id does not identify the active private scene")
-        return scene
 
     def _score_participants(self, scene: PrivateChatScene) -> list[CandidateScore]:
         """Use Task 9's auditable score form without reading notes or public context."""
@@ -297,27 +298,33 @@ class PrivateChatScheduler:
         events: list[EventRecord] = []
         trigger = self._private_trigger(scene)
         for score in scores[:2]:
-            if self._state_provider().stopped:
+            if self._state_provider().stopped or not self._owns(scene):
                 break
             adjustment = 0
             decision = "probe_failed"
             agent = self.agents.get(score.player_id)
             if agent is not None:
                 for attempt in range(2):
+                    if not self._owns(scene):
+                        break
                     try:
                         probe = await agent.probe(trigger)
                     except ModelCallError:
                         decision = "probe_model_call_failed"
-                        if attempt == 1 or self._state_provider().stopped:
+                        if attempt == 1 or self._state_provider().stopped or not self._owns(scene):
                             break
                         continue
+                    if not self._owns(scene):
+                        break
                     if getattr(probe, "fallback", False):
                         decision = "probe_fallback"
-                        if attempt == 1 or self._state_provider().stopped:
+                        if attempt == 1 or self._state_provider().stopped or not self._owns(scene):
                             break
                         continue
                     adjustment, decision = self._bounded_adjustment(probe)
                     break
+            if not self._owns(scene):
+                break
             if decision == "silent":
                 self._mark_quiet(scene, score.player_id)
             adjustments[score.player_id] = adjustment
@@ -344,23 +351,38 @@ class PrivateChatScheduler:
             context_events=tuple(scene.transcript),
             details={"chat_id": scene.chat_id, "participants": list(scene.participant_ids)},
         )
+        if not self._owns(scene):
+            self._end(scene, "ownership_lost")
+            return []
         if self._state_provider().stopped:
             self._end(scene, "stopped")
             return [self._observer_event("scheduler.stopped", scene)]
         try:
             outcome = await agent.run_action(agent_scene)
         except ModelCallError:
+            if not self._owns(scene):
+                self._end(scene, "ownership_lost")
+                return []
             if self._state_provider().stopped:
                 self._end(scene, "stopped")
                 return [self._observer_event("scheduler.stopped", scene)]
             try:
                 outcome = await agent.run_action(agent_scene)
             except ModelCallError:
+                if not self._owns(scene):
+                    self._end(scene, "ownership_lost")
+                    return []
                 self._end(scene, "model_failed")
                 return [self._observer_event("scheduler.normal_action_failed", scene, {"player_id": player_id})]
+        if not self._owns(scene):
+            self._end(scene, "ownership_lost")
+            return []
         return self._apply_outcome(scene, player_id, outcome)
 
     def _apply_outcome(self, scene: PrivateChatScene, player_id: str, outcome: AgentOutcome) -> list[EventRecord]:
+        if not self._owns(scene):
+            self._end(scene, "ownership_lost")
+            return []
         if self._state_provider().stopped:
             self._end(scene, "stopped")
             return [self._observer_event("scheduler.stopped", scene)]
@@ -485,12 +507,14 @@ class PrivateChatScheduler:
     def _end(self, scene: PrivateChatScene, reason: str) -> None:
         self.end_reason = reason
 
-    def _clear_active_scene(self, scene: PrivateChatScene) -> None:
+    def _release_reservation(self, scene: PrivateChatScene) -> None:
         state = self._state_provider()
-        if state.active_scene == scene.chat_id and state.phase == "day.private":
+        if state.active_scene == scene.chat_id:
             state.active_scene = None
-            state.phase = scene.parent_phase
-        self._scene = None
+            if state.phase == "day.private":
+                state.phase = scene.parent_phase
+        if self._scene is scene:
+            self._scene = None
 
     @staticmethod
     def _bounded_adjustment(probe: ReactionProbe) -> tuple[int, str]:
@@ -514,7 +538,7 @@ class PrivateChatScheduler:
 
     def _owns(self, scene: PrivateChatScene) -> bool:
         state = self._state_provider()
-        return state.active_scene == scene.chat_id and state.phase == "day.private"
+        return self._scene is scene and state.active_scene == scene.chat_id and state.phase == "day.private"
 
     @staticmethod
     def _public_shell(event_type: str, scene: PrivateChatScene) -> EventRecord:

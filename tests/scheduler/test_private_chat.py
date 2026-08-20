@@ -327,19 +327,37 @@ async def test_private_cleanup_does_not_restore_a_phase_or_scene_taken_over_exte
     assert state.active_scene == "external-scene"
 
 
-async def test_run_refuses_to_reclaim_a_private_scene_after_an_external_phase_change():
-    """Starting a stale scene must not overwrite a night transition just because its id still remains."""
+async def test_run_releases_its_stale_reservation_without_reclaiming_an_external_phase():
+    """A pre-run night transition frees this slot but is never rewritten back to discussion."""
 
     scheduler, state, _agents = make_scheduler()
     result = await scheduler.request("alice", "bob")
     assert result.scene is not None
     state.phase = "night"
 
-    with pytest.raises(ValueError, match="phase"):
-        await scheduler.run(result.scene.chat_id)
+    events = await scheduler.run(result.scene.chat_id)
 
     assert state.phase == "night"
-    assert state.active_scene == result.scene.chat_id
+    assert state.active_scene is None
+    assert scheduler._scene is None
+    assert [event.type for event in events] == ["chat.private_ended"]
+
+
+async def test_run_releases_only_its_local_reference_when_external_scene_takes_over_before_start():
+    """A stale chat id must not clear the new active scene or alter its phase."""
+
+    scheduler, state, _agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+    state.active_scene = "external-scene"
+    state.phase = "night"
+
+    events = await scheduler.run(result.scene.chat_id)
+
+    assert state.active_scene == "external-scene"
+    assert state.phase == "night"
+    assert scheduler._scene is None
+    assert [event.type for event in events] == ["chat.private_ended"]
 
 
 async def test_one_participant_yield_cannot_quiet_the_other_before_their_turn():
@@ -494,3 +512,119 @@ async def test_stop_after_first_normal_model_failure_prevents_private_retry():
 
     assert len(agents["alice"].scenes) == 1
     assert scheduler.end_reason == "stopped"
+
+
+@pytest.mark.parametrize("takeover", ["night", "external"])
+async def test_probe_await_ownership_loss_never_selects_or_calls_a_normal_action(takeover: str):
+    """A stale probe result cannot select a participant after Task 11 advances the scene."""
+
+    scheduler, state, agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+
+    class TakeOverDuringProbe(ScriptedPrivateAgent):
+        async def probe(self, event):
+            self.probes.append(event)
+            if takeover == "night":
+                state.phase = "night"
+            else:
+                state.active_scene = "external-scene"
+                state.phase = "night"
+            return ReactionProbe(decision="respond", urgency=15, action_type="speak")
+
+    agents["alice"] = TakeOverDuringProbe()
+    scheduler.agents = agents
+
+    events = await scheduler.run(result.scene.chat_id)
+
+    assert not any(event.type == "chat.private_message" for event in events)
+    assert all(not agent.scenes for agent in agents.values())
+    assert scheduler.end_reason == "ownership_lost"
+    assert scheduler._scene is None
+    assert state.phase == "night"
+    assert state.active_scene == (None if takeover == "night" else "external-scene")
+
+
+@pytest.mark.parametrize("takeover", ["night", "external"])
+async def test_normal_await_ownership_loss_discards_the_stale_private_action(takeover: str):
+    """A model response produced after scene loss cannot enter the transcript or event output."""
+
+    scheduler, state, agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+
+    class TakeOverDuringAction(ScriptedPrivateAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            if takeover == "night":
+                state.phase = "night"
+            else:
+                state.active_scene = "external-scene"
+                state.phase = "night"
+            return AgentOutcome(
+                action=SpeakPrivate(actor="alice", chat_id=scene.details["chat_id"], text="stale secret"),
+                round_trips=1,
+            )
+
+    agents["alice"] = TakeOverDuringAction()
+    scheduler.agents = agents
+    agents["alice"].probe_result = ReactionProbe(decision="respond", urgency=15, action_type="speak")
+    agents["bob"].probe_result = ReactionProbe(decision="defer", urgency=-15, action_type="yield")
+
+    events = await scheduler.run(result.scene.chat_id)
+
+    assert not any(event.type == "chat.private_message" for event in events)
+    assert all("stale secret" not in repr(event.payload) for event in events)
+    assert scheduler.end_reason == "ownership_lost"
+    assert scheduler._scene is None
+    assert state.phase == "night"
+    assert state.active_scene == (None if takeover == "night" else "external-scene")
+
+
+async def test_probe_fallback_does_not_retry_after_scene_ownership_is_lost():
+    """Fallback retry uses the same ownership gate as model-error retry."""
+
+    scheduler, state, agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+
+    class LoseOwnershipOnFallback(ScriptedPrivateAgent):
+        async def probe(self, event):
+            self.probes.append(event)
+            state.phase = "night"
+            return ReactionProbe.fallback_silent()
+
+    agents["alice"] = LoseOwnershipOnFallback()
+    scheduler.agents = agents
+
+    await scheduler.run(result.scene.chat_id)
+
+    assert len(agents["alice"].probes) == 1
+    assert scheduler.end_reason == "ownership_lost"
+    assert state.active_scene is None
+    assert state.phase == "night"
+
+
+async def test_normal_model_error_does_not_retry_after_scene_ownership_is_lost():
+    """Normal retry requires the private scene, not merely a non-stopped game."""
+
+    scheduler, state, agents = make_scheduler()
+    result = await scheduler.request("alice", "bob")
+    assert result.scene is not None
+
+    class LoseOwnershipOnFailure(ScriptedPrivateAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            state.active_scene = "external-scene"
+            state.phase = "night"
+            raise ModelCallError("temporary")
+
+    agents["alice"] = LoseOwnershipOnFailure()
+    scheduler.agents = agents
+
+    await scheduler.run(result.scene.chat_id)
+
+    assert len(agents["alice"].scenes) == 1
+    assert scheduler.end_reason == "ownership_lost"
+    assert state.active_scene == "external-scene"
+    assert state.phase == "night"

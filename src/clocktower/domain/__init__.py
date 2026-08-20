@@ -1,0 +1,1 @@
+"""Core game domain contracts."""

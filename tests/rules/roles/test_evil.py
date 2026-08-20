@@ -69,14 +69,22 @@ def test_imp_self_kill_falls_back_to_other_living_minions_when_scarlet_is_poison
     assert threshold_failed[1].payload["candidate_ids"] == ("bob", "carol")
 
 
-def test_imp_self_kill_or_demon_death_without_a_valid_continuation_declares_good_winner():
+def test_disabled_imp_self_kill_without_a_minion_never_returns_an_independently_applicable_good_win():
     game = game_with_roles(alice="imp", bob="chef", carol="saint")
+    game.players["alice"].reminders.add("poisoned")
     context = AbilityContext.from_state(game, "alice")
 
     assert Imp().apply(context, AbilityChoice("alice", ("alice",))) == [
         RuleEffect("kill", {"target_id": "alice", "source": "imp", "requires_healthy": True}),
-        RuleEffect("declare_winner", {"winner": "good", "reason": "demon_dead"}),
     ]
+    assert Imp().on_demon_death(context, continuation_available=False) == []
+
+
+def test_healthy_imp_death_without_a_continuation_declares_good_only_after_death_is_confirmed():
+    game = game_with_roles(alice="imp", bob="chef", carol="saint")
+    game.players["alice"].alive = False
+    context = AbilityContext.from_state(game, "alice")
+
     assert Imp().on_demon_death(context, continuation_available=False) == [
         RuleEffect("declare_winner", {"winner": "good", "reason": "demon_dead"})
     ]

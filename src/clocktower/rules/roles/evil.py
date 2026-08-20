@@ -130,14 +130,12 @@ class Imp:
                     },
                 )
             )
-        else:
-            effects.append(RuleEffect("declare_winner", {"winner": "good", "reason": "demon_dead"}))
         return effects
 
     @staticmethod
     def on_demon_death(ctx: AbilityContext, *, continuation_available: bool) -> list[RuleEffect]:
-        """Declare the fallback win after the engine resolves continuation effects."""
+        """Declare defeat only after the engine has atomically confirmed death."""
 
-        if continuation_available:
+        if ctx.actor.alive or continuation_available:
             return []
         return [RuleEffect("declare_winner", {"winner": "good", "reason": "demon_dead"})]

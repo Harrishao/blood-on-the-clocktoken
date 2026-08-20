@@ -14,6 +14,7 @@ class VoteRecord:
     voter: str
     nomination_id: str
     vote: bool
+    consumes_dead_vote: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,11 +48,17 @@ def cast_vote(state: GameState, voter: str, nomination_id: str, vote: bool) -> V
     except KeyError as error:
         raise IllegalAction(f"unknown voter: {voter}") from error
 
+    consumes_dead_vote = False
     if vote and not player.alive:
         if not player.dead_vote_available:
             raise IllegalAction("dead vote already spent")
-        player.dead_vote_available = False
-    return VoteRecord(voter=voter, nomination_id=nomination_id, vote=vote)
+        consumes_dead_vote = True
+    return VoteRecord(
+        voter=voter,
+        nomination_id=nomination_id,
+        vote=vote,
+        consumes_dead_vote=consumes_dead_vote,
+    )
 
 
 class NominationTracker:
@@ -78,11 +85,9 @@ class NominationTracker:
         """Open one legal nomination and establish its clockwise count order."""
 
         nominator_player = self._player(state, nominator, "nominator")
-        nominee_player = self._player(state, nominee, "nominee")
+        self._player(state, nominee, "nominee")
         if not nominator_player.alive:
             raise IllegalAction("dead players cannot nominate")
-        if not nominee_player.alive:
-            raise IllegalAction("dead players cannot be nominated")
         if nominator in self._nominators:
             raise IllegalAction("player has already nominated today")
         if nominee in self._nominees:

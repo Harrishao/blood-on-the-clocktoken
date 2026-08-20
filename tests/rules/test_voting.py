@@ -30,13 +30,17 @@ def test_qualification_uses_ceiling_of_half_the_living_players(votes, alive_coun
     assert qualifying_tally(votes, alive_count) is expected
 
 
-def test_dead_player_spends_only_remaining_vote():
-    """A dead player who votes twice would have more than one lifetime vote."""
+def test_dead_vote_returns_consumption_intent_without_mutating_game_state():
+    """Mutating the token here would bypass the rule engine's atomic boundary."""
 
     state = sample_voting_state(dead={"bob"})
 
-    cast_vote(state, "bob", "nom-1", True)
+    vote = cast_vote(state, "bob", "nom-1", True)
 
+    assert vote.consumes_dead_vote is True
+    assert state.players["bob"].dead_vote_available is True
+
+    state.players["bob"].dead_vote_available = False
     with pytest.raises(IllegalAction, match="dead vote already spent"):
         cast_vote(state, "bob", "nom-2", True)
 
@@ -55,8 +59,17 @@ def test_only_alive_players_can_nominate_once_and_each_nominee_is_limited_once_p
         tracker.nominate(state, "carol", "bob", accusation="again")
     with pytest.raises(IllegalAction, match="dead players cannot nominate"):
         tracker.nominate(state, "eve", "david", accusation="dead")
-    with pytest.raises(IllegalAction, match="dead players cannot be nominated"):
-        tracker.nominate(state, "david", "eve", accusation="dead")
+
+
+def test_alive_player_can_nominate_dead_player():
+    """Rejecting a dead nominee would remove a legal Trouble Brewing nomination."""
+
+    state = sample_voting_state(dead={"eve"})
+    tracker = NominationTracker(alive_count=state.alive_count)
+
+    nomination = tracker.nominate(state, "david", "eve", accusation="legal target")
+
+    assert nomination.nominee == "eve"
 
 
 def test_votes_follow_clockwise_seat_order_and_nominee_votes_last():

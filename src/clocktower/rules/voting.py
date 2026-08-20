@@ -64,14 +64,23 @@ def cast_vote(state: GameState, voter: str, nomination_id: str, vote: bool) -> V
 class NominationTracker:
     """One day's nominations, public vote order, and execution candidate."""
 
-    def __init__(self, *, alive_count: int) -> None:
+    def __init__(
+        self,
+        *,
+        alive_count: int,
+        nomination_id_prefix: str = "nom",
+    ) -> None:
         if alive_count <= 0:
             raise ValueError("alive_count must be positive")
+        if not nomination_id_prefix:
+            raise ValueError("nomination_id_prefix must not be empty")
         self.alive_count = alive_count
+        self.nomination_id_prefix = nomination_id_prefix
         self._nominators: set[str] = set()
         self._nominees: set[str] = set()
         self._nominations: dict[str, _OpenNomination] = {}
         self._tallies: dict[str, int] = {}
+        self._resolved_tallies: dict[str, int] = {}
         self._qualifying_nominees: set[str] = set()
         self._active_nomination_id: str | None = None
 
@@ -105,7 +114,7 @@ class NominationTracker:
         if self._active_nomination_id is not None:
             raise IllegalAction("previous nomination voting is not complete")
 
-        nomination_id = f"nom-{len(self._nominations) + 1}"
+        nomination_id = f"{self.nomination_id_prefix}-{len(self._nominations) + 1}"
         nomination = Nomination(
             nomination_id=nomination_id,
             nominator=nominator,
@@ -158,7 +167,17 @@ class NominationTracker:
         """Return the current tally for a recorded nomination."""
 
         open_nomination = self._open_nomination_or_complete(nomination_id)
-        return sum(record.vote for record in open_nomination.votes)
+        return self._resolved_tallies.get(
+            nomination_id,
+            sum(record.vote for record in open_nomination.votes),
+        )
+
+    def record_resolved_tally(self, nomination_id: str, votes: int) -> None:
+        """Replace the raw tally after the engine resolves continuous vote rules."""
+
+        open_nomination = self._open_nomination_or_complete(nomination_id)
+        self._resolved_tallies[nomination_id] = votes
+        self.record_tally(open_nomination.nomination.nominee, votes)
 
     def resolve_execution(self) -> str | None:
         """Return the lone qualifying highest nominee, or no execution on a tie."""

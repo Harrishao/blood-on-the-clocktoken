@@ -47,7 +47,9 @@ def test_virgin_marks_first_nomination_and_returns_registration_resolution_for_a
     context = AbilityContext.for_nomination(game, nominator="alice", nominee="bob")
 
     effects = Virgin().on_nominated(context)
-    assert effects[0] == RuleEffect("mark_used", {"player_id": "bob", "ability": "virgin"})
+    assert effects[0] == RuleEffect(
+        "mark_used", {"player_id": "bob", "ability": "virgin", "public": False}
+    )
     assert effects[1].kind == "resolve_virgin_trigger"
     assert effects[1].payload["nominator_id"] == "alice"
     assert effects[1].payload["required_category"] == "townsfolk"
@@ -62,7 +64,10 @@ def test_virgin_first_nomination_marks_used_when_poisoned_or_nominated_by_a_non_
 
         effects = Virgin().on_nominated(AbilityContext.for_nomination(game, nominator="alice", nominee="bob"))
         assert effects == [
-            RuleEffect("mark_used", {"player_id": "bob", "ability": "virgin"})
+            RuleEffect(
+                "mark_used",
+                {"player_id": "bob", "ability": "virgin", "public": False},
+            )
         ] * effect_count
 
 
@@ -70,7 +75,9 @@ def test_virgin_leaves_spy_townsfolk_registration_and_nontrigger_as_policy_optio
     game = game_with_roles(alice="spy", bob="virgin", carol="imp")
     effects = Virgin().on_nominated(AbilityContext.for_nomination(game, nominator="alice", nominee="bob"))
 
-    assert effects[0] == RuleEffect("mark_used", {"player_id": "bob", "ability": "virgin"})
+    assert effects[0] == RuleEffect(
+        "mark_used", {"player_id": "bob", "ability": "virgin", "public": False}
+    )
     assert effects[1].kind == "resolve_virgin_trigger"
     assert effects[1].payload["allows_no_trigger"] is True
     assert {registration.category for registration in effects[1].payload["registration_options"]} >= {"minion", "townsfolk"}

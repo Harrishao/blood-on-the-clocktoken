@@ -37,6 +37,30 @@ def _advance_to_day(engine: RuleEngine) -> None:
     raise AssertionError("night did not reach dawn")
 
 
+def _engine_waiting_for_ravenkeeper() -> RuleEngine:
+    engine = RuleEngine.for_test(
+        {
+            "alice": "imp",
+            "bob": "ravenkeeper",
+            "carol": "chef",
+            "david": "empath",
+            "eve": "monk",
+        },
+        seed=17,
+        phase="night",
+        first_night=False,
+    )
+    engine.advance_night_step()  # absent Poisoner
+    engine.advance_night_step()  # Monk choice request
+    engine.apply_action(UseAbility(actor="eve", action="monk", targets=("carol",)))
+    engine.advance_night_step()  # absent Spy
+    engine.advance_night_step()  # Scarlet Woman notification slot
+    engine.advance_night_step()  # Imp choice request
+    engine.apply_action(UseAbility(actor="alice", action="imp", targets=("bob",)))
+    engine.advance_night_step()  # Ravenkeeper choice request
+    return engine
+
+
 def test_trouble_brewing_night_orders_are_explicit_and_complete():
     """Moving an information role before death resolution changes legal information."""
 
@@ -210,18 +234,76 @@ def test_butler_none_falls_back_to_ordinary_vote_rules_when_poisoned():
     nomination_id = engine.apply_action(
         Nominate(actor="carol", target="bob", accusation="test")
     )[0].payload["nomination_id"]
-    engine.apply_action(CastVote(actor="carol", nomination_id=nomination_id, vote=False))
-
-    with pytest.raises(IllegalAction, match="Butler master"):
-        engine.apply_action(CastVote(actor="alice", nomination_id=nomination_id, vote=True))
-
     engine._apply_effects_atomically(
         (RuleEffect("poison", {"target_id": "alice", "source": "test"}),),
         actor_id="carol",
     )
+    engine.apply_action(CastVote(actor="carol", nomination_id=nomination_id, vote=False))
     engine.apply_action(CastVote(actor="alice", nomination_id=nomination_id, vote=True))
+    events = engine.apply_action(
+        CastVote(actor="bob", nomination_id=nomination_id, vote=False)
+    )
 
-    assert engine.current_vote_order[-1] == "bob"
+    assert next(event for event in events if event.type == "nomination.closed").payload[
+        "tally"
+    ] == 1
+
+
+@pytest.mark.parametrize(("master_vote", "expected_tally"), [(True, 2), (False, 0)])
+@pytest.mark.parametrize(
+    ("nominee", "butler_precedes_master"),
+    [("eve", True), ("alice", False)],
+)
+def test_butler_vote_uses_the_completed_round_independent_of_seat_order(
+    master_vote,
+    expected_tally,
+    nominee,
+    butler_precedes_master,
+):
+    """A Butler's seat must not decide whether the later Master's vote can authorize it."""
+
+    engine = RuleEngine.for_test(
+        {
+            "alice": "butler",
+            "bob": "chef",
+            "carol": "imp",
+            "david": "monk",
+            "eve": "empath",
+        },
+        seed=17,
+    )
+    engine._apply_effects_atomically(
+        (RuleEffect("set_master", {"butler_id": "alice", "master_id": "bob"}),),
+        actor_id="alice",
+    )
+    nomination_id = engine.apply_action(
+        Nominate(actor="carol", target=nominee, accusation="test")
+    )[0].payload["nomination_id"]
+    order = engine.current_vote_order
+    assert (order.index("alice") < order.index("bob")) is butler_precedes_master
+
+    events = []
+    for voter in order:
+        vote = voter == "alice" or (voter == "bob" and master_vote)
+        events = engine.apply_action(
+            CastVote(
+                actor=voter,
+                nomination_id=nomination_id,
+                vote=vote,
+            )
+        )
+
+    closed = next(event for event in events if event.type == "nomination.closed")
+    resolution = next(event for event in events if event.type == "vote.rule_resolved")
+    assert closed.payload["tally"] == expected_tally
+    assert resolution.audience == Audience.observer()
+    assert resolution.payload == {
+        "voter": "alice",
+        "nomination_id": nomination_id,
+        "vote": True,
+        "counted": master_vote,
+        "reason": "butler_master_vote",
+    }
 
 
 def test_virgin_policy_resolution_executes_then_ends_day_in_event_order():
@@ -247,6 +329,28 @@ def test_virgin_policy_resolution_executes_then_ends_day_in_event_order():
     with pytest.raises(IllegalAction, match="game has ended"):
         engine.apply_action(Nominate(actor="eve", target="bob", accusation="too late"))
     assert sum(event.type == "game.ended" for event in engine.events) == 1
+
+
+def test_nontriggering_virgin_use_is_only_audited_to_observer():
+    """A failed Virgin trigger must not confirm the nominee's hidden identity."""
+
+    engine = RuleEngine.for_test(
+        {"alice": "imp", "bob": "virgin", "carol": "chef"}, seed=17
+    )
+
+    events = engine.apply_action(
+        Nominate(actor="alice", target="bob", accusation="test")
+    )
+
+    assert "virgin_used" in engine.state.players["bob"].reminders
+    used = next(event for event in events if event.type == "ability.used")
+    assert used.audience == Audience.observer()
+    assert used.payload == {"player_id": "bob", "ability": "virgin"}
+    assert all(
+        event.payload.get("ability") != "virgin"
+        for event in events
+        if event.visible_to("alice") or event.visible_to("carol")
+    )
 
 
 def test_information_policy_logs_all_candidates_but_projects_only_selected_private_result():
@@ -385,6 +489,23 @@ def test_poisoned_ravenkeeper_remains_misinformed_for_its_night_death_trigger():
     assert any(option["truthful"] is False for option in decision.payload["options"])
 
 
+@pytest.mark.parametrize("targets", [(), ("carol", "david"), ("unknown",)])
+def test_ravenkeeper_rejects_non_single_or_unknown_targets_atomically(targets):
+    """Bypassing handler validation can crash or silently truncate a malformed choice."""
+
+    engine = _engine_waiting_for_ravenkeeper()
+    before_state = engine.state.model_copy(deep=True)
+    before_events = engine.events
+
+    with pytest.raises(IllegalAction, match="illegal Ravenkeeper targets"):
+        engine.apply_action(
+            UseAbility(actor="bob", action="ravenkeeper", targets=targets)
+        )
+
+    assert engine.state == before_state
+    assert engine.events == before_events
+
+
 def test_poisoned_slayer_spends_use_without_killing_or_triggering_demon_death():
     """Checking health after applying the kill would let a disabled Slayer end the game."""
 
@@ -402,6 +523,9 @@ def test_poisoned_slayer_spends_use_without_killing_or_triggering_demon_death():
 
     assert "slayer_used" in engine.state.players["alice"].reminders
     assert engine.state.players["carol"].alive is True
+    used = next(event for event in events if event.type == "ability.used")
+    assert used.audience == Audience.public()
+    assert used.payload["ability"] == "slayer"
     assert not any(event.type == "game.ended" for event in events)
 
 
@@ -446,7 +570,43 @@ def test_imp_self_kill_confirms_death_then_uses_policy_successor_without_good_wi
     assert engine.state.players["carol"].role == "imp"
     assert engine.check_winner() is None
     assert any(event.type == "storyteller.decision" for event in resolved)
+    changed = next(event for event in resolved if event.type == "role.changed_private")
+    assert changed.phase == "night"
+    assert changed.audience == Audience.player("carol")
+    assert "became_imp" not in engine.state.players["carol"].reminders
     assert not any(event.type == "game.ended" for event in resolved)
+
+
+def test_poisoner_becoming_imp_atomically_ends_its_poison():
+    """A transformed Poisoner no longer owns the continuous poisoning ability."""
+
+    engine = RuleEngine.for_test(
+        {
+            "alice": "imp",
+            "bob": "poisoner",
+            "carol": "chef",
+            "david": "empath",
+            "eve": "monk",
+        },
+        seed=17,
+        phase="night",
+        first_night=False,
+    )
+    engine._apply_effects_atomically(
+        (RuleEffect("poison", {"target_id": "carol", "source": "poisoner"}),),
+        actor_id="bob",
+    )
+    imp_effects = Imp().apply(
+        AbilityContext.from_state(engine.state, "alice"),
+        AbilityChoice("alice", ("alice",)),
+    )
+
+    engine._apply_effects_atomically(imp_effects, actor_id="alice")
+
+    assert engine.state.players["bob"].role == "imp"
+    assert engine.state.role_state.poisoned_player_id is None
+    assert engine.state.role_state.poisoned_by_player_id is None
+    assert "poisoned" not in engine.state.players["carol"].reminders
 
 
 def test_prevented_imp_self_kill_does_not_create_a_second_living_imp():
@@ -562,6 +722,42 @@ def test_later_nomination_uses_new_alive_threshold_without_requalifying_earlier_
     assert engine.state.players["bob"].alive is True
 
 
+def test_nomination_ids_are_unique_across_days_and_reject_stale_votes():
+    """Reusing nom-1 after dawn lets a delayed prior-day action hit today's nomination."""
+
+    engine = RuleEngine.for_test(
+        {
+            "alice": "chef",
+            "bob": "empath",
+            "carol": "washerwoman",
+            "david": "monk",
+            "eve": "imp",
+        },
+        seed=17,
+    )
+    stale_id = engine.apply_action(
+        Nominate(actor="alice", target="bob", accusation="day one")
+    )[0].payload["nomination_id"]
+    _vote_all(engine, stale_id, yes=set())
+    engine.end_day()
+    _advance_to_day(engine)
+    current_id = engine.apply_action(
+        Nominate(actor="alice", target="bob", accusation="day two")
+    )[0].payload["nomination_id"]
+    expected_voter = engine.current_vote_order[0]
+    before_state = engine.state.model_copy(deep=True)
+    before_events = engine.events
+
+    with pytest.raises(IllegalAction, match="nomination is not open"):
+        engine.apply_action(
+            CastVote(actor=expected_voter, nomination_id=stale_id, vote=True)
+        )
+
+    assert current_id != stale_id
+    assert engine.state == before_state
+    assert engine.events == before_events
+
+
 def test_imp_execution_at_five_alive_promotes_scarlet_before_demon_win_check():
     """Checking for a living Demon before Scarlet Woman resolves ends a continuing game."""
 
@@ -569,7 +765,7 @@ def test_imp_execution_at_five_alive_promotes_scarlet_before_demon_win_check():
         {
             "alice": "chef",
             "bob": "empath",
-            "carol": "monk",
+            "carol": "washerwoman",
             "david": "scarlet_woman",
             "eve": "imp",
         },
@@ -584,7 +780,23 @@ def test_imp_execution_at_five_alive_promotes_scarlet_before_demon_win_check():
     assert engine.state.players["eve"].alive is False
     assert engine.state.players["david"].role == "imp"
     assert engine.check_winner() is None
+    assert not any(
+        event.type in {"role.changed_private", "role.change_notified"}
+        and event.visible_to("david")
+        for event in events
+    )
+    assert "became_imp" in engine.state.players["david"].reminders
     assert not any(event.type == "game.ended" for event in events)
+
+    night_events = []
+    for _ in range(4):
+        night_events.extend(engine.advance_night_step())
+    notification = next(
+        event for event in night_events if event.type == "role.change_notified"
+    )
+    assert notification.phase == "night"
+    assert notification.audience == Audience.player("david")
+    assert "became_imp" not in engine.state.players["david"].reminders
 
 
 def test_mayor_wins_with_exactly_three_alive_and_no_execution():
@@ -600,6 +812,20 @@ def test_mayor_wins_with_exactly_three_alive_and_no_execution():
     assert [event.payload.get("reason") for event in events if event.type == "game.ended"] == [
         "mayor"
     ]
+
+
+def test_day_ended_event_keeps_the_phase_that_was_ended():
+    """Emitting after the state transition must not relabel a day fact as night."""
+
+    engine = RuleEngine.for_test(
+        {"alice": "chef", "bob": "empath", "carol": "imp"}, seed=17
+    )
+
+    events = engine.end_day()
+
+    ended = next(event for event in events if event.type == "day.ended")
+    assert ended.phase == "day.discussion"
+    assert engine.state.phase == "night"
 
 
 def test_two_living_players_is_evil_win_while_demon_lives():

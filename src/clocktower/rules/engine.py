@@ -380,7 +380,8 @@ class RuleEngine:
         if self.state.phase != "day.discussion":
             raise IllegalAction("nominations require day discussion")
         tracker = deepcopy(self._nominations) or NominationTracker(
-            alive_count=self.state.alive_count
+            alive_count=self.state.alive_count,
+            nomination_id_prefix=f"nom-day-{self.state.day}",
         )
         tracker.update_alive_count(self.state.alive_count)
         nomination = tracker.nominate(
@@ -428,19 +429,12 @@ class RuleEngine:
         record = tracker.cast_vote(
             self.state, action.actor, action.nomination_id, action.vote
         )
-        player = self.state.players[action.actor]
-        if player.role == "butler" and action.vote:
-            master_id = self.state.role_state.butler_masters.get(action.actor)
-            master_is_voting = master_id is not None and any(
-                vote.voter == master_id and vote.vote
-                for vote in tracker.votes_for(action.nomination_id)
+        vote_resolutions: tuple[dict[str, Any], ...] = ()
+        if tracker.active_nomination_id is None:
+            tally, vote_resolutions = self._resolve_completed_tally(
+                tracker, action.nomination_id
             )
-            may_vote = Butler().may_vote(
-                AbilityContext.from_state(self.state, action.actor),
-                master_is_voting=master_is_voting,
-            )
-            if may_vote is False:
-                raise IllegalAction("Butler master is not voting")
+            tracker.record_resolved_tally(action.nomination_id, tally)
 
         effects: list[_PendingEffect] = [
             _PendingEffect(RuleEffect("replace_nomination_tracker", {"tracker": tracker})),
@@ -473,6 +467,19 @@ class RuleEngine:
         )
         if tracker.active_nomination_id is None:
             effects.extend(
+                _PendingEffect(
+                    RuleEffect(
+                        "emit_event",
+                        {
+                            "type": "vote.rule_resolved",
+                            "audience": Audience.observer(),
+                            "payload": resolution,
+                        },
+                    )
+                )
+                for resolution in vote_resolutions
+            )
+            effects.extend(
                 (
                     _PendingEffect(
                         RuleEffect(
@@ -491,6 +498,39 @@ class RuleEngine:
                 )
             )
         return tuple(effects)
+
+    def _resolve_completed_tally(
+        self,
+        tracker: NominationTracker,
+        nomination_id: str,
+    ) -> tuple[int, tuple[dict[str, Any], ...]]:
+        votes = tracker.votes_for(nomination_id)
+        master_votes = {vote.voter: vote.vote for vote in votes}
+        tally = 0
+        resolutions: list[dict[str, Any]] = []
+        for vote in votes:
+            counted = vote.vote
+            player = self.state.players[vote.voter]
+            if vote.vote and player.role == "butler":
+                master_id = self.state.role_state.butler_masters.get(vote.voter)
+                may_vote = Butler().may_vote(
+                    AbilityContext.from_state(self.state, vote.voter),
+                    master_is_voting=bool(
+                        master_id is not None and master_votes.get(master_id, False)
+                    ),
+                )
+                counted = may_vote is not False
+                resolutions.append(
+                    {
+                        "voter": vote.voter,
+                        "nomination_id": nomination_id,
+                        "vote": True,
+                        "counted": counted,
+                        "reason": "butler_master_vote",
+                    }
+                )
+            tally += int(counted)
+        return tally, tuple(resolutions)
 
     def _dispatch_ability(self, action: UseAbility) -> tuple[_PendingEffect, ...]:
         if self.state.phase == "night":
@@ -554,7 +594,10 @@ class RuleEngine:
                     _PendingEffect(
                         RuleEffect(
                             "notify_new_imp",
-                            {"player_id": actor.player_id},
+                            {
+                                "player_id": actor.player_id,
+                                "source": "scarlet_woman",
+                            },
                         ),
                         actor.player_id,
                     )
@@ -630,7 +673,10 @@ class RuleEngine:
                 )
             ]
         elif role == "ravenkeeper":
-            observation = Ravenkeeper().choose(context, action.targets[0])
+            handler = Ravenkeeper()
+            if choice not in handler.legal_choices(context):
+                raise IllegalAction("illegal Ravenkeeper targets")
+            observation = handler.choose(context, action.targets[0])
             effects = [
                 _PendingEffect(
                     RuleEffect(
@@ -748,7 +794,10 @@ class RuleEngine:
         original = self.state.model_copy(deep=True)
         draft = self.state.model_copy(deep=True)
         policy = deepcopy(self.storyteller)
-        transaction: dict[str, Any] = {"tracker": deepcopy(self._nominations)}
+        transaction: dict[str, Any] = {
+            "tracker": deepcopy(self._nominations),
+            "deferred_end_day": None,
+        }
         new_events: list[EventRecord] = []
         demon_deaths: list[_DemonDeath] = []
         pending = tuple(
@@ -948,23 +997,53 @@ class RuleEngine:
             if target_id not in draft.players or not draft.players[target_id].alive:
                 raise ValueError("role successor must be a living player")
             role = effect.payload["role"]
+            source = effect.payload.get("source")
             player = draft.players[target_id]
+            if (
+                draft.role_state.poisoned_by_player_id == target_id
+                and role != "poisoner"
+            ):
+                clear_poison()
             player.role = role
             player.perceived_identity = role
             player.alignment = GameState.ROLE_ALIGNMENTS[role]
             player.known_alignment = GameState.ROLE_ALIGNMENTS[role]
-            player.reminders.add("became_imp")
+            player.reminders.discard("became_imp")
             emit(
                 "role.transformed",
-                payload={"player_id": target_id, "role": role, "source": effect.payload.get("source")},
+                payload={"player_id": target_id, "role": role, "source": source},
                 audience=Audience.observer(),
                 actor=target_id,
             )
+            defer_notification = (
+                role == "imp"
+                and source == "scarlet_woman"
+                and draft.phase.startswith("day")
+            )
+            if defer_notification:
+                player.reminders.add("became_imp")
+            else:
+                emit(
+                    "role.changed_private",
+                    payload={"player_id": target_id, "role": role, "source": source},
+                    audience=Audience.player(target_id),
+                    actor=target_id,
+                )
+
+        def finish_day(payload: dict[str, Any]) -> None:
+            ended_phase = draft.phase
+            draft.phase = "night"
+            draft.role_state.first_night = False
+            draft.role_state.night_step_index = 0
+            draft.role_state.pending_night_role = None
+            draft.role_state.pending_night_actor_id = None
+            draft.role_state.night_deaths = []
+            transaction["tracker"] = None
             emit(
-                "role.changed_private",
-                payload={"player_id": target_id, "role": role},
-                audience=Audience.player(target_id),
-                actor=target_id,
+                "day.ended",
+                payload={"day": draft.day, "reason": payload["reason"]},
+                audience=Audience.public(),
+                phase=ended_phase,
             )
 
         def apply_one(item: _PendingEffect) -> None:
@@ -1002,7 +1081,11 @@ class RuleEngine:
                 emit(
                     "ability.used",
                     payload={"player_id": player_id, "ability": payload["ability"]},
-                    audience=Audience.public(),
+                    audience=(
+                        Audience.public()
+                        if payload.get("public", True)
+                        else Audience.observer()
+                    ),
                     actor=player_id,
                 )
             elif kind == "protect":
@@ -1153,24 +1236,15 @@ class RuleEngine:
                     draft.role_state.winner = payload["winner"]
                     draft.role_state.winner_reason = payload["reason"]
             elif kind == "end_day":
-                draft.phase = "night"
-                draft.role_state.first_night = False
-                draft.role_state.night_step_index = 0
-                draft.role_state.pending_night_role = None
-                draft.role_state.pending_night_actor_id = None
-                draft.role_state.night_deaths = []
-                transaction["tracker"] = None
-                emit(
-                    "day.ended",
-                    payload={"day": draft.day, "reason": payload["reason"]},
-                    audience=Audience.public(),
-                )
+                if transaction["deferred_end_day"] is not None:
+                    raise ValueError("day end is already pending")
+                transaction["deferred_end_day"] = payload
             elif kind == "notify_new_imp":
                 player_id = payload["player_id"]
                 draft.players[player_id].reminders.discard("became_imp")
                 emit(
                     "role.change_notified",
-                    payload={"role": "imp"},
+                    payload={"role": "imp", "source": payload["source"]},
                     audience=Audience.player(player_id),
                     actor=player_id,
                 )
@@ -1193,7 +1267,10 @@ class RuleEngine:
                 draft.role_state.pending_night_actor_id = None
                 draft.role_state.night_deaths = []
                 draft.role_state.executed_today = None
-                transaction["tracker"] = NominationTracker(alive_count=draft.alive_count)
+                transaction["tracker"] = NominationTracker(
+                    alive_count=draft.alive_count,
+                    nomination_id_prefix=f"nom-day-{draft.day}",
+                )
             else:
                 raise ValueError(f"unsupported rule effect: {kind}")
 
@@ -1224,6 +1301,9 @@ class RuleEngine:
             )
             for demon_effect in demon_effects:
                 apply_one(_PendingEffect(demon_effect, demon_death.demon_id))
+
+        if transaction["deferred_end_day"] is not None:
+            finish_day(transaction["deferred_end_day"])
 
         winner = _winner_for(draft)
         if winner is not None and not draft.role_state.game_ended:

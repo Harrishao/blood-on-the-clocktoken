@@ -70,7 +70,16 @@ class Virgin(_ActionRole):
             raise ValueError("Virgin requires a nomination context for itself")
         if "virgin_used" in ctx.actor.reminders:
             return []
-        effects = [RuleEffect("mark_used", {"player_id": ctx.actor_id, "ability": self.role})]
+        effects = [
+            RuleEffect(
+                "mark_used",
+                {
+                    "player_id": ctx.actor_id,
+                    "ability": self.role,
+                    "public": False,
+                },
+            )
+        ]
         if not ctx.is_healthy:
             return effects
 

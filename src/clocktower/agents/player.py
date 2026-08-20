@@ -175,8 +175,16 @@ class PlayerAgent:
             continuation_messages: list[Mapping[str, Any]] = []
             illegal_calls = 0
             source_events: tuple[EventRecord, ...] = ()
+            regular_round_trips = 0
+            request_count = 0
+            correction_pending = False
 
-            for round_number in range(1, MAX_TOOL_ROUND_TRIPS + 1):
+            while correction_pending or regular_round_trips < MAX_TOOL_ROUND_TRIPS:
+                is_correction_response = correction_pending
+                correction_pending = False
+                if not is_correction_response:
+                    regular_round_trips += 1
+                request_count += 1
                 round_state = self._current_state()
                 phase = scene_model.phase or round_state.phase
                 round_scene = scene_model.model_copy(update={"phase": phase})
@@ -206,14 +214,14 @@ class PlayerAgent:
                         return self._outcome(
                             action=None,
                             status="required_action_failed",
-                            round_trips=round_number,
+                            round_trips=request_count,
                             illegal_calls=illegal_calls,
                             start_seq=start_seq,
                         )
                     return self._outcome(
                         action=YieldAction(actor=self.player_id, reason="no_tool_call"),
                         status="yielded",
-                        round_trips=round_number,
+                        round_trips=request_count,
                         illegal_calls=illegal_calls,
                         start_seq=start_seq,
                     )
@@ -265,15 +273,17 @@ class PlayerAgent:
                     next_result_index += 1
                     result_messages.append(result_message)
 
-                if batch_invalid and illegal_calls > 1:
+                if batch_invalid and (is_correction_response or illegal_calls > 1):
                     self._advance_cursor(source_events)
-                    return self._illegal_outcome(round_scene, round_number, start_seq)
+                    return self._illegal_outcome(round_scene, request_count, start_seq)
+                if batch_invalid:
+                    correction_pending = True
                 if outward is not None:
                     self._advance_cursor(source_events)
                     return self._outcome(
                         action=outward,
                         status="completed",
-                        round_trips=round_number,
+                        round_trips=request_count,
                         illegal_calls=illegal_calls,
                         start_seq=start_seq,
                     )
@@ -297,14 +307,14 @@ class PlayerAgent:
                 return self._outcome(
                     action=None,
                     status="required_action_failed",
-                    round_trips=MAX_TOOL_ROUND_TRIPS,
+                    round_trips=request_count,
                     illegal_calls=illegal_calls,
                     start_seq=start_seq,
                 )
             return self._outcome(
                 action=YieldAction(actor=self.player_id, reason="tool_round_trip_limit"),
                 status="yielded",
-                round_trips=MAX_TOOL_ROUND_TRIPS,
+                round_trips=request_count,
                 illegal_calls=illegal_calls,
                 start_seq=start_seq,
             )

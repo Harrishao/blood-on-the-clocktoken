@@ -4,6 +4,7 @@ import json
 from collections.abc import AsyncIterator
 from copy import deepcopy
 
+import pytest
 from pydantic import ValidationError
 
 from clocktower.agents.player import (
@@ -687,6 +688,147 @@ async def test_run_action_stops_after_four_tool_round_trips(tmp_path):
     assert outcome.action == YieldAction(actor="alice", reason="tool_round_trip_limit")
     assert game_state.players["alice"].notebook.notes == "note-4"
     assert sum(record["type"] == "checkpoint" for record in history_records(history)) == 4
+
+
+@pytest.mark.parametrize("required", [False, True])
+async def test_fourth_regular_round_illegal_gets_a_real_fifth_correction_response(
+    tmp_path,
+    required: bool,
+):
+    """The correction allowance must still exist when the first error lands at the limit."""
+
+    adapter = ScriptedAdapter(
+        *(
+            (
+                tool_segment(
+                    "update_notebook",
+                    {"patch": f"note-{index}"},
+                    call_id=f"call-{index}",
+                ),
+            )
+            for index in range(1, 4)
+        ),
+        (tool_segment("unknown", {}, call_id="call-4"),),
+        (
+            tool_segment(
+                "speak_public",
+                {"text": "corrected on the fifth request"},
+                call_id="call-5",
+            ),
+        ),
+    )
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene(required=required))
+
+    assert len(adapter.requests) == 5
+    assert outcome.round_trips == 5
+    assert outcome.status == "completed"
+    assert outcome.action == SpeakPublic(
+        actor="alice", text="corrected on the fifth request"
+    )
+    assert outcome.illegal_corrections == 1
+    assert game_state.players["alice"].notebook.notes == "note-3"
+    assert sum(record["type"] == "checkpoint" for record in history_records(history)) == 3
+
+
+@pytest.mark.parametrize(
+    ("required", "expected_status", "expected_action"),
+    [
+        (
+            False,
+            "yielded",
+            YieldAction(actor="alice", reason="tool_round_trip_limit"),
+        ),
+        (True, "required_action_failed", None),
+    ],
+)
+async def test_early_illegal_response_adds_only_one_turn_to_the_regular_budget(
+    tmp_path,
+    required: bool,
+    expected_status: str,
+    expected_action: YieldAction | None,
+):
+    """An early correction is extra, while later legal notebook calls still stop at five total."""
+
+    adapter = ScriptedAdapter(
+        (tool_segment("unknown", {}, call_id="call-1"),),
+        *(
+            (
+                tool_segment(
+                    "update_notebook",
+                    {"patch": f"note-{index}"},
+                    call_id=f"call-{index}",
+                ),
+            )
+            for index in range(2, 6)
+        ),
+        (
+            tool_segment(
+                "speak_public",
+                {"text": "must not receive an unbounded sixth request"},
+                call_id="call-6",
+            ),
+        ),
+    )
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene(required=required))
+
+    assert len(adapter.requests) == 5
+    assert outcome.round_trips == 5
+    assert outcome.status == expected_status
+    assert outcome.action == expected_action
+    assert outcome.illegal_corrections == 1
+    assert game_state.players["alice"].notebook.notes == "note-5"
+    assert sum(record["type"] == "checkpoint" for record in history_records(history)) == 4
+
+
+@pytest.mark.parametrize(
+    ("required", "expected_status", "expected_action"),
+    [
+        (False, "yielded", YieldAction(actor="alice", reason="illegal_tool_call")),
+        (True, "required_action_failed", None),
+    ],
+)
+async def test_illegal_correction_response_terminates_without_a_sixth_request(
+    tmp_path,
+    required: bool,
+    expected_status: str,
+    expected_action: YieldAction | None,
+):
+    """A second illegal response consumes the one correction turn and stops immediately."""
+
+    adapter = ScriptedAdapter(
+        *(
+            (
+                tool_segment(
+                    "update_notebook",
+                    {"patch": f"note-{index}"},
+                    call_id=f"call-{index}",
+                ),
+            )
+            for index in range(1, 4)
+        ),
+        (tool_segment("unknown", {}, call_id="call-4"),),
+        (tool_segment("still_unknown", {}, call_id="call-5"),),
+        (
+            tool_segment(
+                "speak_public",
+                {"text": "must not run"},
+                call_id="call-6",
+            ),
+        ),
+    )
+    agent, _game_state, _history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene(required=required))
+
+    assert len(adapter.requests) == 5
+    assert outcome.round_trips == 5
+    assert outcome.status == expected_status
+    assert outcome.action == expected_action
+    assert outcome.illegal_corrections == 1
 
 
 async def test_state_provider_refreshes_phase_tools_and_notebook_target_each_round(tmp_path):

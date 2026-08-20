@@ -36,6 +36,10 @@ class ModelSegment:
     source_field: str
     text: str
     incomplete: bool = False
+    tool_index: int | None = None
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    tool_type: str | None = None
 
 
 class ModelCallError(RuntimeError):

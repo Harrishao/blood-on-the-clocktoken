@@ -51,10 +51,37 @@ class _PendingSegment:
     source_field: str
     identity: object
     text: str
+    tool_index: int | None = None
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    tool_type: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _SegmentPart:
+    kind: SegmentKind
+    source_field: str
+    identity: object
+    text: str
+    mergeable: bool
+    tool_index: int | None = None
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    tool_type: str | None = None
+
+
+@dataclass(slots=True)
+class _ToolCallState:
+    tool_call_id: str | None = None
+    tool_name: str | None = None
+    tool_type: str | None = None
 
 
 class OpenAICompatibleAdapter:
     """Parse standard Chat Completions deltas plus configured provider extensions."""
+
+    _METADATA_FIELDS = frozenset({"id", "object", "created", "model", "system_fingerprint", "service_tier", "usage"})
+    _SENSITIVE_KEY_PARTS = frozenset({"authorization", "api_key", "apikey", "headers", "header", "cookie", "cookies", "token", "secret"})
 
     def __init__(self, transport: SSETransport | None = None) -> None:
         self._transport = transport or HttpxSSETransport()
@@ -62,6 +89,10 @@ class OpenAICompatibleAdapter:
     async def stream(self, request: ModelRequest) -> AsyncIterator[ModelSegment]:
         pending: _PendingSegment | None = None
         segment_index = 0
+        saw_done = False
+        tool_states: dict[tuple[int, int], _ToolCallState] = {}
+        metadata_queue: list[tuple[str, str]] = []
+        seen_metadata: set[tuple[str, str]] = set()
 
         def flush(*, incomplete: bool = False) -> ModelSegment | None:
             nonlocal pending, segment_index
@@ -74,10 +105,30 @@ class OpenAICompatibleAdapter:
                 source_field=pending.source_field,
                 text=pending.text,
                 incomplete=incomplete,
+                tool_index=pending.tool_index,
+                tool_call_id=pending.tool_call_id,
+                tool_name=pending.tool_name,
+                tool_type=pending.tool_type,
             )
             segment_index += 1
             pending = None
             return segment
+
+        def flush_metadata() -> list[ModelSegment]:
+            nonlocal segment_index
+            segments = [
+                ModelSegment(
+                    call_id=request.call_id,
+                    index=segment_index + offset,
+                    kind="provider_metadata",
+                    source_field=source_field,
+                    text=text,
+                )
+                for offset, (source_field, text) in enumerate(metadata_queue)
+            ]
+            segment_index += len(segments)
+            metadata_queue.clear()
+            return segments
 
         try:
             async for raw_chunk in self._transport.stream(self._build_transport_request(request)):
@@ -85,41 +136,76 @@ class OpenAICompatibleAdapter:
                 if payload is None:
                     continue
                 if payload is _DONE:
+                    saw_done = True
                     break
                 if "error" in payload:
                     raise _ProviderPayloadError()
 
-                for kind, source_field, identity, text, mergeable in self._chunk_parts(payload, request):
-                    if mergeable and pending is not None and (
+                semantic_parts, metadata_parts = self._chunk_parts(payload, request, tool_states)
+                for metadata in metadata_parts:
+                    key = (metadata.source_field, metadata.text)
+                    if key not in seen_metadata:
+                        seen_metadata.add(key)
+                        metadata_queue.append(key)
+                for part in semantic_parts:
+                    if part.mergeable and pending is not None and (
                         pending.kind,
                         pending.source_field,
                         pending.identity,
-                    ) == (kind, source_field, identity):
-                        pending.text += text
+                    ) == (part.kind, part.source_field, part.identity):
+                        pending.text += part.text
+                        pending.tool_call_id = part.tool_call_id
+                        pending.tool_name = part.tool_name
+                        pending.tool_type = part.tool_type
                         continue
                     flushed = flush()
                     if flushed is not None:
                         yield flushed
-                    if mergeable:
-                        pending = _PendingSegment(kind, source_field, identity, text)
+                    if part.mergeable:
+                        pending = _PendingSegment(
+                            kind=part.kind,
+                            source_field=part.source_field,
+                            identity=part.identity,
+                            text=part.text,
+                            tool_index=part.tool_index,
+                            tool_call_id=part.tool_call_id,
+                            tool_name=part.tool_name,
+                            tool_type=part.tool_type,
+                        )
                     else:
                         yield ModelSegment(
                             call_id=request.call_id,
                             index=segment_index,
-                            kind=kind,
-                            source_field=source_field,
-                            text=text,
+                            kind=part.kind,
+                            source_field=part.source_field,
+                            text=part.text,
+                            tool_index=part.tool_index,
+                            tool_call_id=part.tool_call_id,
+                            tool_name=part.tool_name,
+                            tool_type=part.tool_type,
                         )
                         segment_index += 1
         except Exception as error:
             flushed = flush(incomplete=True)
             if flushed is not None:
                 yield flushed
+            for metadata in flush_metadata():
+                yield metadata
             raise self._safe_error(error) from None
+
+        if not saw_done:
+            flushed = flush(incomplete=True)
+            if flushed is not None:
+                yield flushed
+            for metadata in flush_metadata():
+                yield metadata
+            raise ModelCallError("Model stream interrupted")
 
         flushed = flush()
         if flushed is not None:
             yield flushed
+        for metadata in flush_metadata():
+            yield metadata
 
     @staticmethod
     def _build_transport_request(request: ModelRequest) -> SSERequest:
@@ -176,11 +262,15 @@ class OpenAICompatibleAdapter:
         cls,
         payload: Mapping[str, Any],
         request: ModelRequest,
-    ) -> list[tuple[SegmentKind, str, object, str, bool]]:
-        parts: list[tuple[SegmentKind, str, object, str, bool]] = []
+        tool_states: dict[tuple[int, int], _ToolCallState],
+    ) -> tuple[list[_SegmentPart], list[_SegmentPart]]:
+        semantic_parts: list[_SegmentPart] = []
+        metadata_parts: list[_SegmentPart] = []
         for field, value in payload.items():
-            if field not in {"choices", "error"}:
-                parts.append(("provider_metadata", field, field, cls._json_text(value), False))
+            if field in cls._METADATA_FIELDS:
+                text = cls._safe_metadata_text(value)
+                if text is not None:
+                    metadata_parts.append(_SegmentPart("provider_metadata", field, field, text, False))
 
         choices = payload.get("choices", [])
         if not isinstance(choices, list):
@@ -194,22 +284,25 @@ class OpenAICompatibleAdapter:
             for reasoning_field in request.model.reasoning_fields:
                 text = delta.get(reasoning_field)
                 if isinstance(text, str) and text:
-                    parts.append(("reasoning", reasoning_field, reasoning_field, text, True))
-            cls._append_tool_calls(parts, delta.get("tool_calls"), choice_index)
-            cls._append_tool_results(parts, delta)
+                    semantic_parts.append(_SegmentPart("reasoning", reasoning_field, reasoning_field, text, True))
+            cls._append_tool_calls(semantic_parts, delta.get("tool_calls"), choice_index, tool_states)
+            cls._append_tool_results(semantic_parts, delta)
             content = delta.get("content")
             if isinstance(content, str) and content:
-                parts.append(("final_message", "content", "content", content, True))
+                semantic_parts.append(_SegmentPart("final_message", "content", "content", content, True))
             finish_reason = choice.get("finish_reason")
             if finish_reason is not None:
-                parts.append(("provider_metadata", "finish_reason", ("finish_reason", choice_index), cls._json_text(finish_reason), False))
-        return parts
+                text = cls._safe_metadata_text(finish_reason)
+                if text is not None:
+                    metadata_parts.append(_SegmentPart("provider_metadata", "finish_reason", ("finish_reason", choice_index), text, False))
+        return semantic_parts, metadata_parts
 
     @staticmethod
     def _append_tool_calls(
-        parts: list[tuple[SegmentKind, str, object, str, bool]],
+        parts: list[_SegmentPart],
         tool_calls: object,
         choice_index: int,
+        tool_states: dict[tuple[int, int], _ToolCallState],
     ) -> None:
         if tool_calls is None:
             return
@@ -219,25 +312,83 @@ class OpenAICompatibleAdapter:
             if not isinstance(tool_call, Mapping):
                 raise _ProviderPayloadError()
             tool_index = tool_call.get("index", position)
-            function = tool_call.get("function", {})
-            if not isinstance(function, Mapping):
+            if not isinstance(tool_index, int) or isinstance(tool_index, bool):
                 raise _ProviderPayloadError()
-            arguments = function.get("arguments")
-            if isinstance(arguments, str) and arguments:
-                parts.append(("tool_call", "tool_calls", (choice_index, tool_index), arguments, True))
+            state = tool_states.setdefault((choice_index, tool_index), _ToolCallState())
+            if isinstance(tool_call.get("id"), str):
+                state.tool_call_id = tool_call["id"]
+            if isinstance(tool_call.get("type"), str):
+                state.tool_type = tool_call["type"]
+            function = tool_call.get("function")
+            arguments = ""
+            if function is not None:
+                if not isinstance(function, Mapping):
+                    raise _ProviderPayloadError()
+                if isinstance(function.get("name"), str):
+                    state.tool_name = OpenAICompatibleAdapter._append_fragment(state.tool_name, function["name"])
+                if isinstance(function.get("arguments"), str):
+                    arguments = function["arguments"]
+            parts.append(_SegmentPart(
+                kind="tool_call",
+                source_field="tool_calls",
+                identity=(choice_index, tool_index),
+                text=arguments,
+                mergeable=True,
+                tool_index=tool_index,
+                tool_call_id=state.tool_call_id,
+                tool_name=state.tool_name,
+                tool_type=state.tool_type,
+            ))
 
     @staticmethod
-    def _append_tool_results(
-        parts: list[tuple[SegmentKind, str, object, str, bool]],
-        delta: Mapping[str, Any],
-    ) -> None:
+    def _append_tool_results(parts: list[_SegmentPart], delta: Mapping[str, Any]) -> None:
         for field in ("tool_result", "tool_results"):
             if field in delta:
-                parts.append(("tool_result", field, field, OpenAICompatibleAdapter._json_text(delta[field]), False))
+                text = OpenAICompatibleAdapter._safe_metadata_text(delta[field])
+                if text is not None:
+                    parts.append(_SegmentPart("tool_result", field, field, text, False))
+
+    @classmethod
+    def _safe_metadata_text(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        safe_value = cls._scrub_sensitive_metadata(value)
+        try:
+            return json.dumps(safe_value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _scrub_sensitive_metadata(cls, value: object) -> object:
+        if isinstance(value, Mapping):
+            return {
+                str(key): cls._scrub_sensitive_metadata(nested)
+                for key, nested in value.items()
+                if isinstance(key, str) and not cls._is_sensitive_key(key)
+            }
+        if isinstance(value, list):
+            return [cls._scrub_sensitive_metadata(item) for item in value]
+        return value
+
+    @classmethod
+    def _is_sensitive_key(cls, key: str) -> bool:
+        normalized = "".join(character for character in key.lower() if character.isalnum())
+        key_parts = {part for part in key.lower().replace("-", "_").split("_") if part}
+        return (
+            normalized in cls._SENSITIVE_KEY_PARTS
+            or any(normalized.startswith(part) or normalized.endswith(part) for part in cls._SENSITIVE_KEY_PARTS)
+            or bool(key_parts & cls._SENSITIVE_KEY_PARTS)
+        )
 
     @staticmethod
-    def _json_text(value: object) -> str:
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    def _append_fragment(current: str | None, fragment: str) -> str:
+        if not current:
+            return fragment
+        max_overlap = min(len(current), len(fragment))
+        for overlap in range(max_overlap, 0, -1):
+            if current[-overlap:] == fragment[:overlap]:
+                return current + fragment[overlap:]
+        return current + fragment
 
     @staticmethod
     def _safe_error(error: Exception) -> ModelCallError:
@@ -245,7 +396,7 @@ class OpenAICompatibleAdapter:
             return ModelCallError("Model request timed out")
         if isinstance(error, httpx.HTTPStatusError):
             return ModelCallError(f"Model provider returned HTTP status {error.response.status_code}")
-        if isinstance(error, (ConnectionError, OSError)):
+        if isinstance(error, (httpx.NetworkError, ConnectionError, OSError)):
             return ModelCallError("Model stream interrupted")
         return ModelCallError("Model provider stream failed")
 

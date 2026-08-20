@@ -254,8 +254,72 @@ async def test_run_action_allows_repeated_notebook_updates_with_adjacent_checkpo
     ]
 
 
+async def test_mixed_assistant_final_text_and_tool_identity_are_preserved_without_reasoning(tmp_path):
+    """Tool continuation needs assistant content and exact identity, but never raw reasoning."""
+
+    arguments = '{"patch":"one"}'
+    adapter = ScriptedAdapter(
+        (
+            segment(
+                0,
+                "reasoning",
+                "RAW_REASONING_MUST_NOT_CONTINUE",
+                call_id="call-1",
+                source_field="reasoning_content",
+            ),
+            segment(
+                1,
+                "final_message",
+                "Visible assistant text",
+                call_id="call-1",
+            ),
+            segment(
+                2,
+                "tool_call",
+                arguments,
+                call_id="call-1",
+                tool_index=4,
+                tool_call_id="tool-mixed",
+                tool_name="update_notebook",
+                tool_type="provider_function",
+            ),
+        ),
+        (
+            tool_segment(
+                "speak_public", {"text": "done"}, call_id="call-2"
+            ),
+        ),
+    )
+    agent, _state, _history, _resolver = build_agent(tmp_path, adapter)
+
+    await agent.run_action(AgentScene())
+
+    assistant = next(
+        message
+        for message in adapter.requests[1].messages
+        if message.get("role") == "assistant"
+    )
+    assert assistant == {
+        "role": "assistant",
+        "content": "Visible assistant text",
+        "tool_calls": [
+            {
+                "id": "tool-mixed",
+                "type": "provider_function",
+                "function": {
+                    "name": "update_notebook",
+                    "arguments": arguments,
+                },
+            }
+        ],
+    }
+    assert "RAW_REASONING_MUST_NOT_CONTINUE" not in json.dumps(
+        adapter.requests[1].messages
+    )
+
+
 async def test_run_action_accepts_at_most_one_outward_action_from_parallel_calls(tmp_path):
-    """Two outward intents in one response must never escape as two game mutations."""
+    """Two outward intents invalidate the batch; neither may escape before correction."""
 
     adapter = ScriptedAdapter(
         (
@@ -274,21 +338,187 @@ async def test_run_action_accepts_at_most_one_outward_action_from_parallel_calls
                 tool_index=1,
                 tool_call_id="tool-two",
             ),
-        )
+        ),
+        (
+            tool_segment(
+                "speak_public",
+                {"text": "corrected"},
+                call_id="call-2",
+                tool_call_id="tool-corrected",
+            ),
+        ),
     )
     agent, _state, history, _resolver = build_agent(tmp_path, adapter)
 
     outcome = await agent.run_action(AgentScene())
 
-    assert outcome.action == SpeakPublic(actor="alice", text="one")
+    assert outcome.action == SpeakPublic(actor="alice", text="corrected")
+    assert outcome.illegal_corrections == 1
     results = [
         record["payload"]
         for record in history_records(history)
         if record["type"] == "model.output_segment"
         and record["payload"]["kind"] == "tool_result"
     ]
-    assert [result["tool_call_id"] for result in results] == ["tool-one", "tool-two"]
-    assert results[1]["text"].startswith('{"error":')
+    first_batch = [result for result in results if result["call_id"] == "call-1"]
+    assert [result["tool_call_id"] for result in first_batch] == ["tool-one", "tool-two"]
+    assert all(result["text"].startswith('{"error":') for result in first_batch)
+
+
+async def test_mixed_legal_outward_and_unknown_tool_rejects_whole_batch(tmp_path):
+    """A valid outward call cannot bypass an illegal sibling in the same assistant response."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "speak_public",
+                {"text": "must not escape"},
+                call_id="call-1",
+                tool_index=0,
+                tool_call_id="tool-valid",
+            ),
+            tool_segment(
+                "read_global_state",
+                {},
+                call_id="call-1",
+                index=1,
+                tool_index=1,
+                tool_call_id="tool-illegal",
+            ),
+        ),
+        (
+            tool_segment(
+                "nominate",
+                {"target_player": "bob", "accusation": "corrected"},
+                call_id="call-2",
+            ),
+        ),
+    )
+    agent, _state, history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene())
+
+    assert outcome.action == Nominate(
+        actor="alice", target="bob", accusation="corrected"
+    )
+    first_results = [
+        record["payload"]
+        for record in history_records(history)
+        if record["payload"].get("kind") == "tool_result"
+        and record["payload"].get("call_id") == "call-1"
+    ]
+    assert len(first_results) == 2
+    assert all(json.loads(result["text"]).get("error") for result in first_results)
+
+
+async def test_illegal_parallel_sibling_prevents_notebook_side_effect(tmp_path):
+    """Validation must finish before a notebook update can create a checkpoint."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "update_notebook",
+                {"patch": "must not commit"},
+                call_id="call-1",
+                tool_index=0,
+                tool_call_id="tool-note",
+            ),
+            tool_segment(
+                "unknown",
+                {},
+                call_id="call-1",
+                index=1,
+                tool_index=1,
+                tool_call_id="tool-bad",
+            ),
+        ),
+        (
+            tool_segment(
+                "speak_public",
+                {"text": "corrected"},
+                call_id="call-2",
+            ),
+        ),
+    )
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene())
+
+    assert outcome.action == SpeakPublic(actor="alice", text="corrected")
+    assert game_state.players["alice"].notebook.notes == ""
+    assert all(record["type"] != "checkpoint" for record in history_records(history))
+
+
+async def test_multiple_illegal_calls_in_first_response_consume_one_correction_round(tmp_path):
+    """The correction budget is per assistant response, not per parallel tool call."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment("unknown_one", {}, call_id="call-1", tool_index=0),
+            tool_segment(
+                "unknown_two",
+                {},
+                call_id="call-1",
+                index=1,
+                tool_index=1,
+            ),
+        ),
+        (
+            tool_segment(
+                "speak_public", {"text": "corrected"}, call_id="call-2"
+            ),
+        ),
+    )
+    agent, _state, _history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene())
+
+    assert len(adapter.requests) == 2
+    assert outcome.action == SpeakPublic(actor="alice", text="corrected")
+    assert outcome.illegal_corrections == 1
+
+
+async def test_duplicate_tool_call_id_invalidates_batch_with_one_unambiguous_result(tmp_path):
+    """Duplicate result IDs cannot be paired back to two distinct calls."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "update_notebook",
+                {"patch": "one"},
+                call_id="call-1",
+                tool_index=0,
+                tool_call_id="duplicate-id",
+            ),
+            tool_segment(
+                "speak_public",
+                {"text": "two"},
+                call_id="call-1",
+                index=1,
+                tool_index=1,
+                tool_call_id="duplicate-id",
+            ),
+        ),
+        (
+            tool_segment(
+                "speak_public", {"text": "corrected"}, call_id="call-2"
+            ),
+        ),
+    )
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene())
+
+    assert outcome.action == SpeakPublic(actor="alice", text="corrected")
+    assert game_state.players["alice"].notebook.notes == ""
+    duplicate_results = [
+        record["payload"]
+        for record in history_records(history)
+        if record["payload"].get("kind") == "tool_result"
+        and record["payload"].get("tool_call_id") == "duplicate-id"
+    ]
+    assert len(duplicate_results) == 1
+    assert "duplicate_tool_call_id" in duplicate_results[0]["text"]
 
 
 async def test_unknown_then_out_of_phase_tool_uses_only_one_correction(tmp_path):
@@ -347,6 +577,27 @@ async def test_required_action_without_a_tool_reports_failure_instead_of_yieldin
 
     assert outcome.action is None
     assert outcome.status == "required_action_failed"
+
+
+async def test_required_scene_never_offers_or_accepts_yield_action(tmp_path):
+    """A required choice may stop upstream, but it cannot silently become a voluntary yield."""
+
+    adapter = ScriptedAdapter(
+        (tool_segment("yield_action", {"reason": "no"}, call_id="call-1"),),
+        (tool_segment("yield_action", {"reason": "still no"}, call_id="call-2"),),
+    )
+    agent, _state, _history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene(required=True))
+
+    assert all(
+        "yield_action"
+        not in {tool["function"]["name"] for tool in request.tools}
+        for request in adapter.requests
+    )
+    assert outcome.action is None
+    assert outcome.status == "required_action_failed"
+    assert outcome.illegal_corrections == 1
 
 
 async def test_scene_identifier_binding_rejects_cross_chat_action_then_accepts_correction(tmp_path):
@@ -436,6 +687,55 @@ async def test_run_action_stops_after_four_tool_round_trips(tmp_path):
     assert outcome.action == YieldAction(actor="alice", reason="tool_round_trip_limit")
     assert game_state.players["alice"].notebook.notes == "note-4"
     assert sum(record["type"] == "checkpoint" for record in history_records(history)) == 4
+
+
+async def test_state_provider_refreshes_phase_tools_and_notebook_target_each_round(tmp_path):
+    """Task 6 replaces GameState on commit, so a captured object becomes stale mid-lifecycle."""
+
+    initial = sample_game_state()
+    initial.phase = "day.discussion"
+    replacement = initial.model_copy(update={"phase": "night"}, deep=True)
+    state_box = {"current": initial}
+
+    class ReplacingAdapter(ScriptedAdapter):
+        async def stream(self, request: ModelRequest) -> AsyncIterator[ModelSegment]:
+            self.requests.append(request)
+            if not self.scripts:
+                raise AssertionError("unexpected model call")
+            script = self.scripts.pop(0)
+            if len(self.requests) == 1:
+                state_box["current"] = replacement
+            for scripted_segment in script:
+                yield scripted_segment
+
+    adapter = ReplacingAdapter(
+        (tool_segment("update_notebook", {"patch": "fresh"}, call_id="call-1"),),
+        (segment(0, "final_message", "done", call_id="call-2"),),
+    )
+    history = HistoryWriter(tmp_path / "game.jsonl", EventStream())
+    resolver = RecordingResolver()
+    agent = PlayerAgent(
+        player_id="alice",
+        state_provider=lambda: state_box["current"],
+        resolve_model=resolver,
+        adapter=adapter,
+        history=history,
+    )
+
+    await agent.run_action(AgentScene())
+
+    first_tools = {
+        tool["function"]["name"] for tool in adapter.requests[0].tools
+    }
+    second_tools = {
+        tool["function"]["name"] for tool in adapter.requests[1].tools
+    }
+    assert "speak_public" in first_tools
+    assert "use_ability" not in first_tools
+    assert "use_ability" in second_tools
+    assert "speak_public" not in second_tools
+    assert replacement.players["alice"].notebook.notes == "fresh"
+    assert initial.players["alice"].notebook.notes == ""
 
 
 async def test_probe_is_short_stateless_tool_free_and_does_not_mutate_agent_state(tmp_path):

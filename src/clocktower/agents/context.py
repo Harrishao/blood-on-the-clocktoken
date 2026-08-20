@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from enum import StrEnum
 
 from pydantic import BaseModel, ConfigDict
 
@@ -11,13 +12,67 @@ from clocktower.domain.events import EventRecord
 from clocktower.domain.state import GameState, Notebook
 
 
-_OBSERVER_ONLY_EVENT_TYPES = frozenset(
+class PlayerEventVisibility(StrEnum):
+    """Minimum audience class required before an event may enter a prompt."""
+
+    PUBLIC = "public"
+    PLAYER_PRIVATE = "player_private"
+    OBSERVER = "observer"
+
+
+_PUBLIC_EVENT_TYPES = frozenset(
     {
+        "chat.public_message",
+        "chat.private_ended",
+        "chat.private_started",
+        "claim.public",
+        "day.ended",
+        "execution.none",
+        "execution.resolved",
+        "game.ended",
+        "night.deaths_announced",
+        "nomination.closed",
+        "nomination.opened",
+        "player.public_message",
+        "player.yielded",
+        "vote.cast",
+        "vote.resolved",
+    }
+)
+
+_PLAYER_PRIVATE_EVENT_TYPES = frozenset(
+    {
+        "ability.choice_requested",
+        "chat.private_invitation",
+        "chat.private_message",
+        "chat.private_response",
+        "evil.info_received",
+        "information.received",
+        "notebook.updated",
+        "role.assigned",
+        "role.change_notified",
+        "role.changed_private",
+        "tool.error",
+    }
+)
+
+_OBSERVER_EVENT_TYPES = frozenset(
+    {
+        "ability.no_effect",
+        "butler.master_set",
         "checkpoint",
+        "death.failed",
+        "death.prevented",
+        "death.redirected",
+        "effect.suppressed",
         "game.header",
         "model.output_segment",
+        "poison.applied",
+        "protection.applied",
+        "role.transformed",
         "setup.completed",
         "storyteller.decision",
+        "vote.rule_resolved",
     }
 )
 
@@ -42,11 +97,38 @@ class PlayerContext(BaseModel):
         return tuple(tool.as_openai_tool() for tool in self.tools)
 
 
-def _allowed_player_event(event: EventRecord) -> bool:
-    return (
-        event.type not in _OBSERVER_ONLY_EVENT_TYPES
-        and not event.type.startswith("storyteller.")
-    )
+def _event_visibility(event: EventRecord) -> PlayerEventVisibility | None:
+    if event.type in _PUBLIC_EVENT_TYPES:
+        return PlayerEventVisibility.PUBLIC
+    if event.type in _PLAYER_PRIVATE_EVENT_TYPES:
+        return PlayerEventVisibility.PLAYER_PRIVATE
+    if event.type in _OBSERVER_EVENT_TYPES or event.type.startswith("storyteller."):
+        return PlayerEventVisibility.OBSERVER
+    if event.type == "player.died":
+        return (
+            PlayerEventVisibility.PUBLIC
+            if event.phase.startswith("day")
+            else PlayerEventVisibility.OBSERVER
+        )
+    if event.type == "ability.used":
+        return (
+            PlayerEventVisibility.PUBLIC
+            if event.payload.get("ability") == "slayer"
+            else PlayerEventVisibility.OBSERVER
+        )
+    return None
+
+
+def _allowed_player_event(event: EventRecord, player_id: str) -> bool:
+    visibility = _event_visibility(event)
+    if visibility is PlayerEventVisibility.PUBLIC:
+        return event.audience.kind == "public"
+    if visibility is PlayerEventVisibility.PLAYER_PRIVATE:
+        return (
+            event.audience.kind in {"player", "players"}
+            and player_id in event.audience.player_ids
+        )
+    return False
 
 
 def project_context(
@@ -63,7 +145,7 @@ def project_context(
     visible = tuple(
         event.model_copy(deep=True)
         for event in authorized
-        if _allowed_player_event(event)
+        if _allowed_player_event(event, player_id)
     )
     player = state.players[player_id]
     return PlayerContext(
@@ -76,4 +158,4 @@ def project_context(
     )
 
 
-__all__ = ["PlayerContext", "project_context"]
+__all__ = ["PlayerContext", "PlayerEventVisibility", "project_context"]

@@ -9,15 +9,15 @@ from clocktower.rules.setup import ROLE_CATEGORIES
 class Butler:
     role = "butler"
     first_night_order = 8
-    other_night_order = None
+    other_night_order = 7
 
     def legal_choices(self, ctx: AbilityContext) -> list[AbilityChoice]:
-        if not ctx.is_healthy:
+        if not ctx.actor.alive:
             return []
         return [
             AbilityChoice(ctx.actor_id, (player_id,))
-            for player_id, player in ctx.state.players.items()
-            if player.alive and player_id != ctx.actor_id
+            for player_id in ctx.state.players
+            if player_id != ctx.actor_id
         ]
 
     def apply(self, ctx: AbilityContext, choice: AbilityChoice) -> list[RuleEffect]:
@@ -26,12 +26,20 @@ class Butler:
         return [
             RuleEffect(
                 "set_master",
-                {"butler_id": ctx.actor_id, "master_id": choice.targets[0]},
+                {
+                    "butler_id": ctx.actor_id,
+                    "master_id": choice.targets[0],
+                    "requires_healthy": True,
+                },
             )
         ]
 
-    def may_vote(self, ctx: AbilityContext, *, master_is_voting: bool) -> bool:
-        return ctx.is_healthy and master_is_voting
+    def may_vote(self, ctx: AbilityContext, *, master_is_voting: bool) -> bool | None:
+        """Return ``None`` when ordinary vote validation remains authoritative."""
+
+        if not ctx.is_healthy:
+            return None
+        return master_is_voting
 
 
 class Drunk:

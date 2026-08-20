@@ -6,15 +6,19 @@ from clocktower.rules.setup import build_setup
 from tests.builders import game_with_roles
 
 
-def test_poisoner_poison_lasts_through_the_next_day_when_healthy():
+def test_poisoner_keeps_dead_target_choices_when_poisoned_and_returns_a_health_gated_poison_intent():
     game = game_with_roles(alice="poisoner", bob="chef", carol="imp")
+    game.players["bob"].alive = False
     context = AbilityContext.from_state(game, "alice")
 
     assert Poisoner().apply(context, AbilityChoice("alice", ("bob",))) == [
-        RuleEffect("poison", {"target_id": "bob", "source": "poisoner", "expires": "next_day_end"})
+        RuleEffect(
+            "poison",
+            {"target_id": "bob", "source": "poisoner", "expires": "next_day_end", "requires_healthy": True},
+        )
     ]
     game.players["alice"].reminders.add("poisoned")
-    assert Poisoner().legal_choices(AbilityContext.from_state(game, "alice")) == []
+    assert AbilityChoice("alice", ("bob",)) in Poisoner().legal_choices(AbilityContext.from_state(game, "alice"))
 
 
 def test_scarlet_woman_becomes_imp_only_when_a_demon_dies_with_at_least_five_alive():
@@ -37,21 +41,32 @@ def test_baron_exposes_the_same_setup_delta_used_by_core_setup_validation():
     assert build_setup(7, roles, seed=17).category_counts == (3, 2, 1, 1)
 
 
-def test_imp_kills_nightly_and_self_kill_offers_only_living_minions_as_successors():
-    game = game_with_roles(alice="imp", bob="poisoner", carol="scarlet_woman", david="chef")
-    game.players["carol"].alive = False
+def test_imp_kills_dead_targets_and_prioritizes_a_healthy_living_scarlet_woman_as_self_kill_successor():
+    game = game_with_roles(
+        alice="imp", bob="poisoner", carol="scarlet_woman", david="chef", eve="monk"
+    )
+    game.players["david"].alive = False
     context = AbilityContext.from_state(game, "alice")
 
     assert Imp().apply(context, AbilityChoice("alice", ("david",))) == [
-        RuleEffect("kill", {"target_id": "david", "source": "imp"})
+        RuleEffect("kill", {"target_id": "david", "source": "imp", "requires_healthy": True})
     ]
-    assert Imp().apply(context, AbilityChoice("alice", ("alice",))) == [
-        RuleEffect("kill", {"target_id": "alice", "source": "imp"}),
-        RuleEffect(
-            "transform_role",
-            {"candidate_ids": ("bob",), "role": "imp", "source": "imp_self_kill"},
-        ),
-    ]
+    self_kill = Imp().apply(context, AbilityChoice("alice", ("alice",)))
+    assert self_kill[1].payload["candidate_ids"] == ("carol",)
+
+
+def test_imp_self_kill_falls_back_to_other_living_minions_when_scarlet_is_poisoned_or_threshold_fails():
+    game = game_with_roles(
+        alice="imp", bob="poisoner", carol="scarlet_woman", david="chef", eve="monk"
+    )
+    game.players["carol"].reminders.add("poisoned")
+    self_kill = Imp().apply(AbilityContext.from_state(game, "alice"), AbilityChoice("alice", ("alice",)))
+
+    assert self_kill[1].payload["candidate_ids"] == ("bob", "carol")
+    game.alive_count = 4
+    game.players["carol"].reminders.clear()
+    threshold_failed = Imp().apply(AbilityContext.from_state(game, "alice"), AbilityChoice("alice", ("alice",)))
+    assert threshold_failed[1].payload["candidate_ids"] == ("bob", "carol")
 
 
 def test_imp_self_kill_or_demon_death_without_a_valid_continuation_declares_good_winner():
@@ -59,7 +74,7 @@ def test_imp_self_kill_or_demon_death_without_a_valid_continuation_declares_good
     context = AbilityContext.from_state(game, "alice")
 
     assert Imp().apply(context, AbilityChoice("alice", ("alice",))) == [
-        RuleEffect("kill", {"target_id": "alice", "source": "imp"}),
+        RuleEffect("kill", {"target_id": "alice", "source": "imp", "requires_healthy": True}),
         RuleEffect("declare_winner", {"winner": "good", "reason": "demon_dead"}),
     ]
     assert Imp().on_demon_death(context, continuation_available=False) == [

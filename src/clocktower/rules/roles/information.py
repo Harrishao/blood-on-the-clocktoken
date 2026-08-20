@@ -32,11 +32,13 @@ class Washerwoman(_InformationRole):
 
     @staticmethod
     def _observations(ctx: AbilityContext) -> tuple[Observation, ...]:
-        return _pair_character_observations(ctx, "townsfolk")
+        return _pair_character_observations(ctx, "townsfolk", handler_role=Washerwoman.role)
 
     @staticmethod
     def _all_structural_observations(ctx: AbilityContext) -> tuple[Observation, ...]:
-        return _pair_character_observations(ctx, "townsfolk", include_unregistered=True)
+        return _pair_character_observations(
+            ctx, "townsfolk", handler_role=Washerwoman.role, include_unregistered=True
+        )
 
 
 class Librarian(_InformationRole):
@@ -50,13 +52,15 @@ class Librarian(_InformationRole):
 
     @staticmethod
     def _observations(ctx: AbilityContext) -> tuple[Observation, ...]:
-        observations = _pair_character_observations(ctx, "outsider")
-        return observations or (Observation(kind="librarian", number=0),)
+        observations = _pair_character_observations(ctx, "outsider", handler_role=Librarian.role)
+        if _can_register_without_category(ctx, "outsider"):
+            observations = _unique_observations([Observation(kind=Librarian.role, number=0), *observations])
+        return observations
 
     @staticmethod
     def _all_structural_observations(ctx: AbilityContext) -> tuple[Observation, ...]:
-        return (Observation(kind="librarian", number=0),) + _pair_character_observations(
-            ctx, "outsider", include_unregistered=True
+        return (Observation(kind=Librarian.role, number=0),) + _pair_character_observations(
+            ctx, "outsider", handler_role=Librarian.role, include_unregistered=True
         )
 
 
@@ -65,8 +69,10 @@ class Investigator(_InformationRole):
     first_night_order = 4
 
     def legal_observations(self, ctx: AbilityContext) -> tuple[Observation, ...]:
-        truthful = _pair_character_observations(ctx, "minion")
-        structural = _pair_character_observations(ctx, "minion", include_unregistered=True)
+        truthful = _pair_character_observations(ctx, "minion", handler_role=self.role)
+        structural = _pair_character_observations(
+            ctx, "minion", handler_role=self.role, include_unregistered=True
+        )
         return _with_false_information(ctx, truthful, structural)
 
 
@@ -100,9 +106,7 @@ class Empath(_InformationRole):
     def observe(self, game: GameState, *, actor_seat: int = 0) -> Observation:
         """Count only living neighbours, wrapping at the ends of the circle."""
 
-        players = _seated_players(game)
-        index = _require_seat(game, actor_seat)
-        neighbours = (players[index - 1], players[(index + 1) % len(players)])
+        neighbours = _living_neighbours(game, actor_seat)
         count = sum(player.alive and player.alignment == "evil" for player in neighbours)
         return Observation(kind="empath", number=count)
 
@@ -185,7 +189,6 @@ class Undertaker(_InformationRole):
             Observation(kind="undertaker", character=option.character, truthful=option.truthful)
             for option in options
         )
-        true_observations = tuple(observation for observation in observations if observation.truthful)
         if not ctx.is_misinformed:
             return observations
         structural = tuple(
@@ -255,9 +258,13 @@ class Recluse(_InformationRole):
 
 
 def _pair_character_observations(
-    ctx: AbilityContext, category: str, *, include_unregistered: bool = False
+    ctx: AbilityContext,
+    category: str,
+    *,
+    handler_role: str,
+    include_unregistered: bool = False,
 ) -> tuple[Observation, ...]:
-    players = [player for player in _seated_players(ctx.state) if player.player_id != ctx.actor_id]
+    players = _seated_players(ctx.state)
     if len(players) < 2:
         return ()
     observations: list[Observation] = []
@@ -279,7 +286,7 @@ def _pair_character_observations(
                 )
                 observations.append(
                     Observation(
-                        kind=ctx.actor.role,
+                        kind=handler_role,
                         character=registration.character,
                         player_ids=pair,
                         truthful=registration.truthful,
@@ -365,13 +372,9 @@ def _chef_observations(ctx: AbilityContext) -> tuple[Observation, ...]:
 
 
 def _empath_observations(ctx: AbilityContext) -> tuple[Observation, ...]:
-    players = _seated_players(ctx.state)
-    index = _require_seat(ctx.state, ctx.actor.seat)
-    neighbours = (players[index - 1], players[(index + 1) % len(players)])
+    neighbours = _living_neighbours(ctx.state, ctx.actor.seat)
     registration_options = [
         registrations_for(player.player_id, RegistrationQuery.ALIGNMENT, ctx)
-        if player.alive
-        else ()
         for player in neighbours
     ]
     observations: list[Observation] = []
@@ -393,6 +396,27 @@ def _require_seat(game: GameState, seat: int) -> int:
         if player.seat == seat:
             return index
     raise ValueError(f"unknown seat: {seat}")
+
+
+def _living_neighbours(game: GameState, actor_seat: int):
+    players = _seated_players(game)
+    index = _require_seat(game, actor_seat)
+    neighbour_ids: list[str] = []
+    for step in (1, -1):
+        for offset in range(1, len(players)):
+            candidate = players[(index + step * offset) % len(players)]
+            if candidate.alive:
+                if candidate.player_id not in neighbour_ids:
+                    neighbour_ids.append(candidate.player_id)
+                break
+    return tuple(game.players[player_id] for player_id in neighbour_ids)
+
+
+def _can_register_without_category(ctx: AbilityContext, category: str) -> bool:
+    return all(
+        any(registration.category != category for registration in _registered_character_options(ctx, player_id))
+        for player_id in ctx.state.players
+    )
 
 
 def _exactly_two_known_targets(game: GameState, targets: Iterable[str]) -> tuple[str, str]:

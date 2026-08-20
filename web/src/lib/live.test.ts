@@ -14,6 +14,13 @@ class FakeEventSource implements EventSourceLike {
 
 const flushPromises = () => new Promise((resolve) => window.setTimeout(resolve, 0))
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((fulfill, fail) => { resolve = fulfill; reject = fail })
+  return { promise, resolve, reject }
+}
+
 describe("connectLive", () => {
   it("deduplicates replay and reconnects from the last accepted sequence", async () => {
     const sources: FakeEventSource[] = []
@@ -133,5 +140,106 @@ describe("connectLive", () => {
 
     expect(probeSignal?.aborted).toBe(true)
     expect(sources).toHaveLength(1)
+  })
+
+  it("serializes repeated errors from one failed source behind a single reconnect", async () => {
+    const sources: FakeEventSource[] = []
+    const probes: Array<ReturnType<typeof deferred<"valid" | "future">>> = []
+    const scheduled: Array<() => void> = []
+    connectLive(2, () => undefined, {
+      createEventSource: (url) => {
+        const source = new FakeEventSource(url)
+        sources.push(source)
+        return source
+      },
+      probeCursor: () => {
+        const probe = deferred<"valid" | "future">()
+        probes.push(probe)
+        return probe.promise
+      },
+      scheduleReconnect: (callback) => { scheduled.push(callback); return scheduled.length },
+      cancelReconnect: () => undefined,
+    })
+
+    sources[0].fail()
+    probes[0].resolve("valid")
+    await flushPromises()
+    expect(scheduled).toHaveLength(1)
+
+    sources[0].fail()
+    expect(probes).toHaveLength(1)
+    scheduled[0]()
+    expect(sources).toHaveLength(2)
+    expect(sources.filter((source) => !source.closed)).toHaveLength(1)
+
+    sources[0].fail()
+    scheduled[0]()
+    expect(probes).toHaveLength(1)
+    expect(sources).toHaveLength(2)
+    expect(sources.filter((source) => !source.closed)).toHaveLength(1)
+  })
+
+  it("ignores an old source error after its replacement is open", async () => {
+    const sources: FakeEventSource[] = []
+    const probes: Array<ReturnType<typeof deferred<"valid" | "future">>> = []
+    const scheduled: Array<() => void> = []
+    connectLive(1, () => undefined, {
+      createEventSource: (url) => {
+        const source = new FakeEventSource(url)
+        sources.push(source)
+        return source
+      },
+      probeCursor: () => {
+        const probe = deferred<"valid" | "future">()
+        probes.push(probe)
+        return probe.promise
+      },
+      scheduleReconnect: (callback) => { scheduled.push(callback); return scheduled.length },
+      cancelReconnect: () => undefined,
+    })
+
+    const lateError = sources[0].onerror
+    sources[0].fail()
+    probes[0].resolve("valid")
+    await flushPromises()
+    scheduled[0]()
+    expect(sources).toHaveLength(2)
+
+    lateError?.(new Event("error"))
+    await flushPromises()
+    scheduled[1]?.()
+    expect(probes).toHaveLength(1)
+    expect(sources).toHaveLength(2)
+    expect(sources.filter((source) => !source.closed)).toHaveLength(1)
+  })
+
+  it("makes source and timer callbacks inert after disconnect", async () => {
+    const sources: FakeEventSource[] = []
+    const scheduled: Array<() => void> = []
+    const received = vi.fn()
+    const disconnect = connectLive(0, received, {
+      createEventSource: (url) => {
+        const source = new FakeEventSource(url)
+        sources.push(source)
+        return source
+      },
+      probeCursor: async () => "valid",
+      scheduleReconnect: (callback) => { scheduled.push(callback); return scheduled.length },
+      cancelReconnect: () => undefined,
+    })
+
+    const lateMessage = sources[0].onmessage
+    const lateError = sources[0].onerror
+    sources[0].emit({ ...orderedFixture[2], seq: 3 })
+    expect(scheduled).toHaveLength(1)
+    disconnect()
+    scheduled[0]()
+    lateMessage?.({ data: JSON.stringify(orderedFixture[0]) } as MessageEvent<string>)
+    lateError?.(new Event("error"))
+    await flushPromises()
+
+    expect(received).not.toHaveBeenCalled()
+    expect(sources).toHaveLength(1)
+    expect(sources[0].closed).toBe(true)
   })
 })

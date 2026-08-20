@@ -41,80 +41,111 @@ export function connectLive(
   let source: EventSourceLike | null = null
   let retryHandle: number | null = null
   let retryScheduled = false
+  let retryOwner: number | null = null
   let probeController: AbortController | null = null
   let closed = false
+  let owner = 0
 
-  const scheduleOpen = () => {
-    if (closed || retryScheduled) return
+  const owns = (token: number, candidate?: EventSourceLike) =>
+    !closed && owner === token && (candidate === undefined || source === candidate)
+
+  const retire = (token: number, candidate: EventSourceLike) => {
+    if (!owns(token, candidate)) return false
+    candidate.onmessage = null
+    candidate.onerror = null
+    candidate.close()
+    source = null
+    return true
+  }
+
+  const scheduleOpen = (token: number) => {
+    if (!owns(token) || retryScheduled) return
     retryScheduled = true
+    retryOwner = token
     const handle = schedule(() => {
+      if (!owns(token) || !retryScheduled || retryOwner !== token) return
       retryScheduled = false
+      retryOwner = null
       retryHandle = null
-      open()
+      open(token)
     })
-    if (retryScheduled) retryHandle = handle
+    if (retryScheduled && retryOwner === token) retryHandle = handle
   }
 
-  const reconnect = () => {
-    if (closed) return
-    source?.close()
-    scheduleOpen()
+  const reconnect = (token: number, failedSource: EventSourceLike) => {
+    if (!retire(token, failedSource)) return
+    scheduleOpen(token)
   }
 
-  const probeAndReconnect = (failedSource: EventSourceLike) => {
-    if (closed || source !== failedSource || probeController !== null) return
-    failedSource.close()
+  const probeAndReconnect = (token: number, failedSource: EventSourceLike) => {
+    if (probeController !== null || !retire(token, failedSource)) return
     const controller = new AbortController()
     probeController = controller
     void probe(`/api/events?after_seq=${cursor}`, controller.signal)
       .then((result) => {
-        if (closed || probeController !== controller) return
+        if (!owns(token) || probeController !== controller) return
         probeController = null
         if (result === "future") {
           cursor = 0
           options.onGenerationReset?.()
         }
-        scheduleOpen()
+        scheduleOpen(token)
       })
       .catch((error) => {
-        if (closed || probeController !== controller) return
+        if (!owns(token) || probeController !== controller) return
         probeController = null
         if (!(error instanceof DOMException && error.name === "AbortError")) {
-          scheduleOpen()
+          scheduleOpen(token)
         }
       })
   }
 
-  const open = () => {
-    if (closed) return
+  const open = (expectedOwner = owner) => {
+    if (!owns(expectedOwner)) return
+    if (source !== null) {
+      source.onmessage = null
+      source.onerror = null
+      source.close()
+      source = null
+    }
+    const token = ++owner
     const nextSource = create(`/api/events?after_seq=${cursor}`)
     source = nextSource
     nextSource.onmessage = (message) => {
+      if (!owns(token, nextSource)) return
       try {
         const event = parseEventRecord(JSON.parse(message.data))
         if (event.seq <= cursor) return
         if (event.seq !== cursor + 1) {
           options.onError?.(`Live sequence gap after ${cursor}`)
-          reconnect()
+          reconnect(token, nextSource)
           return
         }
         cursor = event.seq
         onEvent(event)
       } catch (error) {
         options.onError?.(error instanceof Error ? error.message : "Invalid live event")
-        reconnect()
+        reconnect(token, nextSource)
       }
     }
-    nextSource.onerror = () => probeAndReconnect(nextSource)
+    nextSource.onerror = () => probeAndReconnect(token, nextSource)
   }
 
   open()
   return () => {
     closed = true
-    source?.close()
+    owner += 1
+    if (source !== null) {
+      source.onmessage = null
+      source.onerror = null
+      source.close()
+      source = null
+    }
     probeController?.abort()
     probeController = null
     if (retryHandle !== null) cancel(retryHandle)
+    retryHandle = null
     retryScheduled = false
+    retryOwner = null
   }
 }

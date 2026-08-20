@@ -6,6 +6,8 @@ from typing import Literal
 
 from pydantic import BaseModel
 
+from clocktower.domain.state import Notebook
+
 
 class IllegalAction(ValueError):
     """An action cannot be performed under the current game rules."""
@@ -64,7 +66,7 @@ class UseAbility(PlayerAction):
 
 class UpdateNotebook(PlayerAction):
     kind: Literal["update_notebook"] = "update_notebook"
-    patch: str
+    notebook: Notebook
 
 
 class YieldAction(PlayerAction):

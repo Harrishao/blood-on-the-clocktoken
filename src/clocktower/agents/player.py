@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from itertools import count
 from typing import Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, StrictInt, ValidationError
 
 from clocktower.agents.context import PlayerContext, project_context
 from clocktower.agents.tools import ToolIntentError, parse_tool_intent
@@ -59,6 +59,19 @@ class ReactionProbe(BaseModel):
     decision: Literal["respond", "defer", "silent"]
     urgency: StrictInt = Field(ge=-15, le=15)
     action_type: Literal["speak", "private_chat", "nominate", "yield"]
+    _fallback: bool = PrivateAttr(default=False)
+
+    @property
+    def fallback(self) -> bool:
+        """True only for a local parser fallback, never a provider-controlled schema field."""
+
+        return self._fallback
+
+    @classmethod
+    def fallback_silent(cls) -> ReactionProbe:
+        probe = cls.model_construct(decision="silent", urgency=0, action_type="yield")
+        probe._fallback = True
+        return probe
 
 
 class AgentOutcome(BaseModel):
@@ -249,10 +262,7 @@ class PlayerAgent:
                         intent = item.intent
                         if isinstance(intent, UpdateNotebook):
                             live_state = self._current_state()
-                            notebook = Notebook(
-                                notes=intent.patch,
-                                attention=live_state.players[self.player_id].notebook.attention,
-                            )
+                            notebook = intent.notebook.model_copy(deep=True)
                             await self.history.update_notebook(
                                 live_state, self.player_id, notebook
                             )
@@ -371,7 +381,7 @@ class PlayerAgent:
         try:
             return ReactionProbe.model_validate_json(content)
         except (ValidationError, ValueError):
-            return self._silent_probe()
+            return self._silent_probe(fallback=True)
 
     def _resolve_model(self, *, short: bool) -> ResolvedModel:
         resolver = self._model_resolver
@@ -731,7 +741,9 @@ class PlayerAgent:
         return AgentScene.model_validate(scene)
 
     @staticmethod
-    def _silent_probe() -> ReactionProbe:
+    def _silent_probe(*, fallback: bool = False) -> ReactionProbe:
+        if fallback:
+            return ReactionProbe.fallback_silent()
         return ReactionProbe(decision="silent", urgency=0, action_type="yield")
 
 

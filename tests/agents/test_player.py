@@ -103,6 +103,19 @@ def tool_segment(
     )
 
 
+def notebook_payload(notes: str) -> dict[str, object]:
+    return {
+        "notebook": {
+            "notes": notes,
+            "attention": {
+                "players": [],
+                "pending_actions": [],
+                "watch_triggers": [],
+            },
+        }
+    }
+
+
 def build_agent(tmp_path, adapter: ScriptedAdapter):
     game_state = sample_game_state()
     game_state.phase = "day.discussion"
@@ -222,8 +235,8 @@ async def test_run_action_allows_repeated_notebook_updates_with_adjacent_checkpo
     """Batching notebook changes would lose the required checkpoint after each accepted patch."""
 
     adapter = ScriptedAdapter(
-        (tool_segment("update_notebook", {"patch": "first"}, call_id="call-1"),),
-        (tool_segment("update_notebook", {"patch": "second"}, call_id="call-2"),),
+        (tool_segment("update_notebook", notebook_payload("first"), call_id="call-1"),),
+        (tool_segment("update_notebook", notebook_payload("second"), call_id="call-2"),),
         (
             tool_segment(
                 "nominate",
@@ -258,7 +271,7 @@ async def test_run_action_allows_repeated_notebook_updates_with_adjacent_checkpo
 async def test_mixed_assistant_final_text_and_tool_identity_are_preserved_without_reasoning(tmp_path):
     """Tool continuation needs assistant content and exact identity, but never raw reasoning."""
 
-    arguments = '{"patch":"one"}'
+    arguments = json.dumps(notebook_payload("one"), separators=(",", ":"))
     adapter = ScriptedAdapter(
         (
             segment(
@@ -419,7 +432,7 @@ async def test_illegal_parallel_sibling_prevents_notebook_side_effect(tmp_path):
         (
             tool_segment(
                 "update_notebook",
-                {"patch": "must not commit"},
+                notebook_payload("must not commit"),
                 call_id="call-1",
                 tool_index=0,
                 tool_call_id="tool-note",
@@ -486,7 +499,7 @@ async def test_duplicate_tool_call_id_invalidates_batch_with_one_unambiguous_res
         (
             tool_segment(
                 "update_notebook",
-                {"patch": "one"},
+                notebook_payload("one"),
                 call_id="call-1",
                 tool_index=0,
                 tool_call_id="duplicate-id",
@@ -675,7 +688,7 @@ async def test_run_action_stops_after_four_tool_round_trips(tmp_path):
     """Notebook-only responses must still obey the hard model/tool lifecycle budget."""
 
     scripts = tuple(
-        (tool_segment("update_notebook", {"patch": f"note-{index}"}, call_id=f"call-{index}"),)
+        (tool_segment("update_notebook", notebook_payload(f"note-{index}"), call_id=f"call-{index}"),)
         for index in range(1, 6)
     )
     adapter = ScriptedAdapter(*scripts)
@@ -702,7 +715,7 @@ async def test_fourth_regular_round_illegal_gets_a_real_fifth_correction_respons
             (
                 tool_segment(
                     "update_notebook",
-                    {"patch": f"note-{index}"},
+                    notebook_payload(f"note-{index}"),
                     call_id=f"call-{index}",
                 ),
             )
@@ -757,7 +770,7 @@ async def test_early_illegal_response_adds_only_one_turn_to_the_regular_budget(
             (
                 tool_segment(
                     "update_notebook",
-                    {"patch": f"note-{index}"},
+                    notebook_payload(f"note-{index}"),
                     call_id=f"call-{index}",
                 ),
             )
@@ -804,7 +817,7 @@ async def test_illegal_correction_response_terminates_without_a_sixth_request(
             (
                 tool_segment(
                     "update_notebook",
-                    {"patch": f"note-{index}"},
+                    notebook_payload(f"note-{index}"),
                     call_id=f"call-{index}",
                 ),
             )
@@ -851,7 +864,7 @@ async def test_state_provider_refreshes_phase_tools_and_notebook_target_each_rou
                 yield scripted_segment
 
     adapter = ReplacingAdapter(
-        (tool_segment("update_notebook", {"patch": "fresh"}, call_id="call-1"),),
+        (tool_segment("update_notebook", notebook_payload("fresh"), call_id="call-1"),),
         (segment(0, "final_message", "done", call_id="call-2"),),
     )
     history = HistoryWriter(tmp_path / "game.jsonl", EventStream())
@@ -935,7 +948,8 @@ async def test_probe_malformed_output_safely_degrades_to_silent(tmp_path):
 
     result = await agent.probe(public_claim(actor="bob", mentions={"alice"}))
 
-    assert result == ReactionProbe(decision="silent", urgency=0, action_type="yield")
+    assert result.fallback is True
+    assert result.decision == "silent"
 
 
 async def test_probe_refuses_observer_only_event_type_even_if_audience_is_mislabeled_public(tmp_path):

@@ -1,20 +1,47 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import ClassVar
+from typing import Any, ClassVar
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class AttentionState(StrEnum):
+    """Deprecated scalar compatibility input for notebooks created before structured attention."""
     IDLE = "idle"
     ACTIVE = "active"
     NEEDS_ATTENTION = "needs_attention"
 
 
+class NotebookAttention(BaseModel):
+    """Structured, scheduler-visible metadata that never contains notebook prose."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    players: list[str] = Field(default_factory=list)
+    pending_actions: list[str] = Field(default_factory=list)
+    watch_triggers: list[str] = Field(default_factory=list)
+
+
 class Notebook(BaseModel):
     notes: str = ""
-    attention: AttentionState = AttentionState.IDLE
+    attention: NotebookAttention = Field(default_factory=NotebookAttention)
+
+    @model_validator(mode="before")
+    @classmethod
+    def convert_legacy_scalar_attention(cls, value: Any) -> Any:
+        """Accept old scalar construction without inventing an unsafe always-on relevance rule."""
+
+        if not isinstance(value, dict):
+            return value
+        attention = value.get("attention")
+        if isinstance(attention, (AttentionState, str)) and str(attention) in {
+            AttentionState.IDLE.value,
+            AttentionState.ACTIVE.value,
+            AttentionState.NEEDS_ATTENTION.value,
+        }:
+            return {**value, "attention": {}}
+        return value
 
 
 class PlayerState(BaseModel):

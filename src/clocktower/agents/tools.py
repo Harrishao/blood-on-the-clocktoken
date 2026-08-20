@@ -126,8 +126,30 @@ _TOOLS = {
     ),
     "update_notebook": ToolDefinition(
         name="update_notebook",
-        description="Replace your private notebook text.",
-        parameters=_object_schema({"patch": {"type": "string"}}, ("patch",)),
+        description="Replace your private notebook with text and structured scheduling attention.",
+        parameters=_object_schema(
+            {
+                "notebook": {
+                    "type": "object",
+                    "properties": {
+                        "notes": {"type": "string"},
+                        "attention": {
+                            "type": "object",
+                            "properties": {
+                                "players": {"type": "array", "items": {"type": "string"}},
+                                "pending_actions": {"type": "array", "items": {"type": "string"}},
+                                "watch_triggers": {"type": "array", "items": {"type": "string"}},
+                            },
+                            "required": ["players", "pending_actions", "watch_triggers"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "required": ["notes", "attention"],
+                    "additionalProperties": False,
+                }
+            },
+            ("notebook",),
+        ),
     ),
     "yield_action": ToolDefinition(
         name="yield_action",
@@ -205,6 +227,7 @@ def _validate_json_schema_types(name: str, arguments: dict[str, Any]) -> None:
         valid = (
             (expected == "string" and isinstance(value, str))
             or (expected == "boolean" and type(value) is bool)
+            or (expected == "object" and isinstance(value, dict))
             or (
                 expected == "array"
                 and isinstance(value, list)
@@ -268,7 +291,7 @@ def parse_tool_intent(
             ),
         ),
         "update_notebook": (
-            frozenset({"patch"}),
+            frozenset({"notebook"}),
             lambda data: UpdateNotebook(actor=player_id, **data),
         ),
         "yield_action": (

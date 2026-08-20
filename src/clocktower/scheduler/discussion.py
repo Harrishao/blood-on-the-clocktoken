@@ -5,11 +5,13 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from typing import Any, Protocol
 
+from clocktower.agents.context import is_safe_public_event
 from clocktower.agents.player import AgentOutcome, AgentScene, PlayerAgent, ReactionProbe
-from clocktower.domain.actions import Nominate, PlayerAction, SpeakPublic, YieldAction
+from clocktower.domain.actions import IllegalAction, Nominate, PlayerAction, SpeakPublic, YieldAction
 from clocktower.domain.events import Audience, EventRecord
 from clocktower.domain.state import GameState
 from clocktower.rules.engine import RuleEngine
+from clocktower.models.protocol import ModelCallError
 
 from .scoring import CandidateScore, ScoreContext, choose_candidate, score_candidates
 
@@ -36,6 +38,8 @@ class DiscussionScheduler:
     ) -> None:
         if action_budget <= 0 or quiet_windows <= 0 or per_player_action_limit <= 0:
             raise ValueError("discussion budgets must be positive")
+        if eligibility_threshold <= 0:
+            raise ValueError("eligibility_threshold must be positive")
         self._state_provider = state_provider
         self.agents = dict(agents)
         self.rules = rules
@@ -60,11 +64,13 @@ class DiscussionScheduler:
 
         if self.end_reason is not None:
             return []
+        state = self._state_provider()
+        if state.stopped:
+            return [self._stop_event()]
         if self.action_count >= self.action_budget:
             return [self._end("action_budget")]
 
-        state = self._state_provider()
-        if self.trigger_event.audience.kind != "public" or not state.phase.startswith("day.discussion"):
+        if not is_safe_public_event(self.trigger_event) or not state.phase.startswith("day.discussion"):
             self._increment_quiet()
             return self._quiet_events([])
 
@@ -75,6 +81,7 @@ class DiscussionScheduler:
                 action_counts=self.action_counts,
                 last_speaker=self.last_speaker,
                 per_player_action_limit=self.per_player_action_limit,
+                available_player_ids=frozenset(self.agents),
             ),
         )
         self.initial_ranking = tuple(score.player_id for score in base_scores)
@@ -85,6 +92,9 @@ class DiscussionScheduler:
 
         adjusted_scores, probe_events = await self._probe_top_two(base_scores)
         events.extend(probe_events)
+        if self._state_provider().stopped:
+            events.append(self._stop_event())
+            return events
         eligible = [
             score
             for score in adjusted_scores
@@ -107,13 +117,25 @@ class DiscussionScheduler:
             events.append(self._observer_event("scheduler.action_rejected", {"player_id": selected_id, "reason": "missing_agent"}))
             return events + self._quiet_events(adjusted_scores)
 
-        outcome = await agent.run_action(
-            AgentScene(
-                phase="day.discussion",
-                purpose="public_discussion",
-                allowed_tools=("speak_public", "nominate", "yield_action"),
-            )
+        scene = AgentScene(
+            phase="day.discussion",
+            purpose="public_discussion",
+            allowed_tools=("speak_public", "nominate", "yield_action"),
         )
+        try:
+            outcome = await agent.run_action(scene)
+        except ModelCallError:
+            try:
+                outcome = await agent.run_action(scene)
+            except ModelCallError:
+                self._increment_quiet()
+                return events + [
+                    self._observer_event(
+                        "scheduler.normal_action_failed",
+                        {"player_id": selected_id, "reason": "model_call_failed_after_retry"},
+                    ),
+                    *self._quiet_events([]),
+                ]
         return events + self._apply_outcome(selected_id, outcome)
 
     async def _probe_top_two(
@@ -129,12 +151,21 @@ class DiscussionScheduler:
             decision = "probe_failed"
             agent = self.agents.get(score.player_id)
             if agent is not None:
-                try:
-                    probe = await agent.probe(self.trigger_event)
+                for attempt in range(2):
+                    try:
+                        probe = await agent.probe(self.trigger_event)
+                    except ModelCallError:
+                        decision = "probe_model_call_failed"
+                        if attempt == 1:
+                            break
+                        continue
+                    if getattr(probe, "fallback", False):
+                        decision = "probe_fallback"
+                        if attempt == 1:
+                            break
+                        continue
                     adjustment, decision = _bounded_adjustment(probe)
-                except Exception:
-                    adjustment = 0
-                    decision = "probe_failed"
+                    break
             adjustments[score.player_id] = adjustment
             audit_events.append(
                 self._observer_event(
@@ -153,6 +184,8 @@ class DiscussionScheduler:
         )
 
     def _apply_outcome(self, selected_id: str, outcome: AgentOutcome) -> list[EventRecord]:
+        if self._state_provider().stopped:
+            return [self._stop_event()]
         action = outcome.action
         if action is None or isinstance(action, YieldAction):
             self._increment_quiet()
@@ -168,7 +201,7 @@ class DiscussionScheduler:
             ]
         try:
             rule_events = self.rules.apply_action(action)
-        except Exception as error:
+        except IllegalAction as error:
             self._increment_quiet()
             return [
                 self._observer_event(
@@ -197,7 +230,12 @@ class DiscussionScheduler:
         events = [
             self._observer_event(
                 "scheduler.quiet_window",
-                {"quiet_count": self.quiet_count, "eligible_count": len(scores)},
+                {
+                    "quiet_count": self.quiet_count,
+                    "eligible_count": sum(
+                        score.total >= self.eligibility_threshold for score in scores
+                    ),
+                },
             )
         ]
         if self.quiet_count >= self.quiet_windows:
@@ -209,6 +247,13 @@ class DiscussionScheduler:
         return self._observer_event(
             "scheduler.ended",
             {"reason": reason, "action_count": self.action_count, "quiet_count": self.quiet_count},
+        )
+
+    def _stop_event(self) -> EventRecord:
+        self.end_reason = "stopped"
+        return self._observer_event(
+            "scheduler.stopped",
+            {"action_count": self.action_count, "quiet_count": self.quiet_count},
         )
 
     def _ranking_event(self, scores: list[CandidateScore]) -> EventRecord:

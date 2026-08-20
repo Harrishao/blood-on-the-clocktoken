@@ -1,4 +1,5 @@
-from clocktower.domain.state import AttentionState
+from clocktower.domain.events import Audience, EventRecord
+from clocktower.domain.state import NotebookAttention
 from clocktower.scheduler.scoring import ScoreContext, choose_candidate, score_candidates
 from tests.builders import public_claim, sample_game_state
 
@@ -7,7 +8,7 @@ def test_mentioned_player_scores_above_unrelated_player_with_auditable_features(
     """Removing the public-mention contribution would lose a direct discussion reply."""
 
     state = sample_game_state()
-    state.players["bob"].notebook.attention = AttentionState.NEEDS_ATTENTION
+    state.players["bob"].notebook.attention = NotebookAttention(watch_triggers=["claim.public"])
 
     scores = score_candidates(
         public_claim(actor="alice", mentions={"bob"}),
@@ -78,3 +79,44 @@ def test_cooldown_repeat_risk_and_budget_pressure_keep_separate_reasons():
     assert by_feature["repeat_risk"].contribution == -25
     assert by_feature["budget_pressure"].contribution == -15
     assert all(feature.reason != "not applicable" for feature in by_feature.values() if feature.contribution)
+
+
+def test_structured_attention_matches_only_the_current_public_event():
+    """Applying nonempty attention to every event would create permanent hidden scheduling bias."""
+
+    state = sample_game_state()
+    state.players["bob"].notebook.attention = NotebookAttention(
+        players=["alice"],
+        watch_triggers=["claim.public"],
+        pending_actions=["nominate"],
+    )
+    claim = public_claim(actor="alice", mentions={"carol"})
+    claim.payload["action_key"] = "nominate"
+    unrelated = EventRecord(
+        phase="day.discussion",
+        type="player.public_message",
+        actor="david",
+        audience=Audience.public(),
+        payload={"mentions": ["carol"]},
+    )
+
+    matched = {score.player_id: score for score in score_candidates(claim, state)}["bob"]
+    unmatched = {score.player_id: score for score in score_candidates(unrelated, state)}["bob"]
+    matched_features = {feature.name: feature for feature in matched.features}
+    unmatched_features = {feature.name: feature for feature in unmatched.features}
+
+    assert matched_features["trigger"].contribution == 20
+    assert "alice" in matched_features["trigger"].reason
+    assert matched_features["pending_action"].contribution == 15
+    assert "nominate" in matched_features["pending_action"].reason
+    assert unmatched_features["trigger"].contribution == 0
+    assert unmatched_features["pending_action"].contribution == 0
+
+
+def test_dead_player_with_an_agent_remains_a_discussion_candidate():
+    """Filtering by alive status removes a dead player's permitted public speech opportunity."""
+
+    state = sample_game_state(dead={"bob"})
+    scores = score_candidates(public_claim(actor="alice", mentions={"bob"}), state)
+
+    assert "bob" in {score.player_id for score in scores}

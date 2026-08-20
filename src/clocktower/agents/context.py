@@ -131,6 +131,12 @@ def _allowed_player_event(event: EventRecord, player_id: str) -> bool:
     return False
 
 
+def is_safe_public_event(event: EventRecord) -> bool:
+    """Return true only for an explicitly classified public fact with public audience."""
+
+    return _event_visibility(event) is PlayerEventVisibility.PUBLIC and event.audience.kind == "public"
+
+
 def project_context(
     player_id: str,
     state: GameState,
@@ -158,4 +164,4 @@ def project_context(
     )
 
 
-__all__ = ["PlayerContext", "PlayerEventVisibility", "project_context"]
+__all__ = ["PlayerContext", "PlayerEventVisibility", "is_safe_public_event", "project_context"]

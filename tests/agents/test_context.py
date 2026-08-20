@@ -4,7 +4,7 @@ import pytest
 
 from clocktower.agents.context import project_context
 from clocktower.domain.events import Audience, EventRecord
-from clocktower.domain.state import Notebook
+from clocktower.domain.state import AttentionState, Notebook, NotebookAttention
 from tests.builders import sample_game_state
 
 
@@ -105,6 +105,25 @@ def test_context_contains_only_the_players_own_notebook_copy():
 
     assert context.notebook.notes == "ALICE_NOTE"
     assert "BOB_NOTE_SECRET" not in context.model_dump_json()
+
+
+def test_notebook_attention_serializes_as_structured_metadata_with_safe_legacy_conversion():
+    """A scalar attention flag cannot express event-scoped scheduling relevance."""
+
+    structured = Notebook(
+        notes="private",
+        attention=NotebookAttention(
+            players=["bob"], pending_actions=["nominate"], watch_triggers=["claim.public"]
+        ),
+    )
+    legacy = Notebook(notes="old", attention=AttentionState.ACTIVE)
+
+    assert structured.model_dump(mode="json")["attention"] == {
+        "players": ["bob"],
+        "pending_actions": ["nominate"],
+        "watch_triggers": ["claim.public"],
+    }
+    assert legacy.attention == NotebookAttention()
 
 
 def test_tools_are_restricted_by_phase_and_player_authority():

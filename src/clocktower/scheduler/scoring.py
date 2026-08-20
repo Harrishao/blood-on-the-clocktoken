@@ -6,8 +6,9 @@ from dataclasses import dataclass, field, replace
 import random
 from typing import Mapping
 
+from clocktower.agents.context import is_safe_public_event
 from clocktower.domain.events import EventRecord
-from clocktower.domain.state import AttentionState, GameState
+from clocktower.domain.state import GameState, NotebookAttention
 
 
 WEIGHTS = {
@@ -55,6 +56,7 @@ class ScoreContext:
     action_counts: Mapping[str, int] = field(default_factory=dict)
     last_speaker: str | None = None
     per_player_action_limit: int = 2
+    available_player_ids: frozenset[str] | None = None
 
 
 def score_candidates(
@@ -64,7 +66,7 @@ def score_candidates(
 ) -> list[CandidateScore]:
     """Score eligible living players from a public event and structured metadata only."""
 
-    if event.audience.kind != "public" or not event.phase.startswith("day.discussion"):
+    if not is_safe_public_event(event) or not event.phase.startswith("day.discussion"):
         return []
 
     context = context or ScoreContext()
@@ -72,13 +74,19 @@ def score_candidates(
     eligible = [
         player
         for player in state.players.values()
-        if player.alive and action_counts.get(player.player_id, 0) < context.per_player_action_limit
+        if (
+            action_counts.get(player.player_id, 0) < context.per_player_action_limit
+            and (context.available_player_ids is None or player.player_id in context.available_player_ids)
+        )
     ]
     if not eligible:
         return []
 
     target_ids = _direct_target_ids(event)
     mentioned_ids = _string_set(event.payload.get("mentions"))
+    related_player_ids = target_ids | mentioned_ids
+    trigger_keys = frozenset({event.type}) | _explicit_keys(event.payload, "trigger_key", "trigger_keys")
+    action_keys = _explicit_keys(event.payload, "action_key", "action_keys")
     minimum_actions = min(action_counts.get(player.player_id, 0) for player in eligible)
     scores = [
         _score_player(
@@ -86,6 +94,9 @@ def score_candidates(
             attention=player.notebook.attention,
             target_ids=target_ids,
             mentioned_ids=mentioned_ids,
+            related_player_ids=related_player_ids,
+            trigger_keys=trigger_keys,
+            action_keys=action_keys,
             action_count=action_counts.get(player.player_id, 0),
             minimum_actions=minimum_actions,
             last_speaker=context.last_speaker,
@@ -119,19 +130,31 @@ def choose_candidate(scores: list[CandidateScore], seed_state: int | str | bytes
 def _score_player(
     *,
     player_id: str,
-    attention: AttentionState,
+    attention: NotebookAttention,
     target_ids: frozenset[str],
     mentioned_ids: frozenset[str],
+    related_player_ids: frozenset[str],
+    trigger_keys: frozenset[str],
+    action_keys: frozenset[str],
     action_count: int,
     minimum_actions: int,
     last_speaker: str | None,
     per_player_action_limit: int,
 ) -> CandidateScore:
+    matched_attention_players = tuple(sorted(set(attention.players) & set(related_player_ids)))
+    matched_watch_triggers = tuple(sorted(set(attention.watch_triggers) & set(trigger_keys)))
+    matched_pending_actions = tuple(
+        sorted(
+            set(attention.pending_actions)
+            & {"speak_public", "nominate"}
+            & set(action_keys)
+        )
+    )
     active = {
         "direct_target": player_id in target_ids,
         "mentioned": player_id in mentioned_ids,
-        "trigger": attention == AttentionState.NEEDS_ATTENTION,
-        "pending_action": attention == AttentionState.ACTIVE,
+        "trigger": bool(matched_attention_players or matched_watch_triggers),
+        "pending_action": bool(matched_pending_actions),
         "fairness": action_count == minimum_actions,
         "recent_speaker": player_id == last_speaker,
         "repeat_risk": action_count > 0,
@@ -140,8 +163,8 @@ def _score_player(
     reasons = {
         "direct_target": "event actor or structured target",
         "mentioned": "named in public event",
-        "trigger": "notebook attention requests a public trigger follow-up",
-        "pending_action": "notebook attention marks a pending action",
+        "trigger": _trigger_reason(matched_attention_players, matched_watch_triggers),
+        "pending_action": _pending_reason(matched_pending_actions),
         "fairness": "fewest completed discussion actions",
         "recent_speaker": "most recent public speaker is cooling down",
         "repeat_risk": "player has already acted in this scene",
@@ -175,3 +198,23 @@ def _string_set(value: object) -> frozenset[str]:
     if not isinstance(value, (list, tuple, set, frozenset)):
         return frozenset()
     return frozenset(item for item in value if isinstance(item, str))
+
+
+def _explicit_keys(payload: Mapping[str, object], single: str, plural: str) -> frozenset[str]:
+    values = set(_string_set(payload.get(plural)))
+    value = payload.get(single)
+    if isinstance(value, str):
+        values.add(value)
+    return frozenset(values)
+
+
+def _trigger_reason(players: tuple[str, ...], triggers: tuple[str, ...]) -> str:
+    matches = [f"attention player {value!r}" for value in players]
+    matches.extend(f"watch trigger {value!r}" for value in triggers)
+    return "matched " + ", ".join(matches) if matches else "not applicable"
+
+
+def _pending_reason(actions: tuple[str, ...]) -> str:
+    if not actions:
+        return "not applicable"
+    return "pending action matched " + ", ".join(repr(action) for action in actions)

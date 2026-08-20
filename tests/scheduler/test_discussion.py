@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass, field
 
 from clocktower.agents.player import AgentOutcome, ReactionProbe
@@ -186,7 +187,116 @@ async def test_orchestrator_hooks_commit_scheduler_facts_before_dependent_calls_
     normal = next(index for index, marker in enumerate(markers) if marker.startswith("normal:"))
     public = markers.index("event:player.public_message")
     assert ranking < first_probe < selection < normal < public
-    assert safe_points == 3
+    assert safe_points == 5
+
+
+async def test_committed_public_action_becomes_the_next_nonzero_trigger():
+    """The next ranking must cite the durable public event, never its pre-commit seq=0 draft."""
+
+    next_seq = 100
+
+    async def event_sink(events):
+        nonlocal next_seq
+        committed = tuple(
+            event.model_copy(update={"seq": next_seq + index})
+            for index, event in enumerate(events)
+        )
+        next_seq += len(committed)
+        return committed
+
+    scheduler, _agents, _rules = make_scheduler(event_sink=event_sink)
+
+    first = await scheduler.step()
+    public = next(event for event in first if event.type == "player.public_message")
+    assert public.seq > 0
+    assert scheduler.trigger_event == public
+
+    second = await scheduler.step()
+    ranking = next(event for event in second if event.type == "scheduler.ranking")
+    assert ranking.seq > public.seq
+    assert ranking.payload["trigger_seq"] == public.seq
+    assert all(event.seq > 0 for event in first + second)
+
+
+async def test_stop_arriving_during_ranking_sink_prevents_any_probe():
+    """A committed ranking is a causal boundary before the first short model call."""
+
+    ranking_started = asyncio.Event()
+    ranking_release = asyncio.Event()
+    stop_requested = False
+
+    async def event_sink(events):
+        if any(event.type == "scheduler.ranking" for event in events):
+            ranking_started.set()
+            await ranking_release.wait()
+        return tuple(
+            event.model_copy(update={"seq": index + 10})
+            for index, event in enumerate(events)
+        )
+
+    async def safe_point():
+        if stop_requested:
+            scheduler.test_state.stopped = True
+
+    scheduler, agents, rules = make_scheduler(
+        event_sink=event_sink,
+        safe_point=safe_point,
+    )
+    task = asyncio.create_task(scheduler.step())
+    try:
+        await asyncio.wait_for(ranking_started.wait(), timeout=1)
+        stop_requested = True
+        ranking_release.set()
+        events = await asyncio.wait_for(task, timeout=1)
+
+        assert all(not agent.probes and not agent.scenes for agent in agents.values())
+        assert rules.actions == []
+        assert events[-1].type == "scheduler.stopped"
+    finally:
+        ranking_release.set()
+        if not task.done():
+            task.cancel()
+
+
+async def test_stop_arriving_during_selection_sink_prevents_normal_model_call():
+    """Selection must be durable and pass the owner safe point before normal inference starts."""
+
+    selection_started = asyncio.Event()
+    selection_release = asyncio.Event()
+    stop_requested = False
+
+    async def event_sink(events):
+        if any(event.type == "scheduler.selection" for event in events):
+            selection_started.set()
+            await selection_release.wait()
+        return tuple(
+            event.model_copy(update={"seq": index + 20})
+            for index, event in enumerate(events)
+        )
+
+    async def safe_point():
+        if stop_requested:
+            scheduler.test_state.stopped = True
+
+    scheduler, agents, rules = make_scheduler(
+        event_sink=event_sink,
+        safe_point=safe_point,
+    )
+    task = asyncio.create_task(scheduler.step())
+    try:
+        await asyncio.wait_for(selection_started.wait(), timeout=1)
+        stop_requested = True
+        selection_release.set()
+        events = await asyncio.wait_for(task, timeout=1)
+
+        assert sum(len(agent.probes) for agent in agents.values()) == 2
+        assert all(not agent.scenes for agent in agents.values())
+        assert rules.actions == []
+        assert events[-1].type == "scheduler.stopped"
+    finally:
+        selection_release.set()
+        if not task.done():
+            task.cancel()
 
 
 async def test_quiet_windows_and_hard_action_budget_end_the_scene():

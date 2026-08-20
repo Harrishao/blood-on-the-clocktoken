@@ -7,7 +7,15 @@ import pytest
 
 from clocktower.agents.player import AgentOutcome, AgentScene, ReactionProbe
 from clocktower.config import GameConfig
-from clocktower.domain.actions import CastVote, Nominate, SpeakPublic, UseAbility, YieldAction
+from clocktower.domain.actions import (
+    CastVote,
+    Nominate,
+    RequestPrivateChat,
+    SpeakPrivate,
+    SpeakPublic,
+    UseAbility,
+    YieldAction,
+)
 from clocktower.event_stream import EventStream
 from clocktower.history import HistoryWriteError, HistoryWriter
 from clocktower.models.protocol import ModelCallError
@@ -81,7 +89,15 @@ class ToggleHistoryWriter(HistoryWriter):
         return await super().append(event)
 
 
-def make_orchestrator(tmp_path, agents, *, history_type=HistoryWriter, reload_model_config=None):
+def make_orchestrator(
+    tmp_path,
+    agents,
+    *,
+    history_type=HistoryWriter,
+    reload_model_config=None,
+    discussion_action_budget=4,
+    private_chat_action_budget=2,
+):
     rules = RuleEngine.start_game(tuple(agents), seed=17)
     history = history_type(tmp_path / "game.jsonl", EventStream())
     orchestrator = GameOrchestrator(
@@ -92,9 +108,9 @@ def make_orchestrator(tmp_path, agents, *, history_type=HistoryWriter, reload_mo
             seed=17,
             player_ids=tuple(agents),
             history_directory=tmp_path,
-            discussion_action_budget=4,
+            discussion_action_budget=discussion_action_budget,
             discussion_quiet_windows=1,
-            private_chat_action_budget=2,
+            private_chat_action_budget=private_chat_action_budget,
             private_chat_quiet_windows=1,
         ),
         reload_model_config=reload_model_config,
@@ -160,6 +176,70 @@ async def test_required_model_failure_retries_once_then_stops_without_fallback(t
         assert rules.state.role_state.pending_night_actor_id == "david"
         assert rules.state.role_state.poisoned_player_id is None
         assert not any(event.type == "poison.applied" for event in history.stream.after(0))
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_required_agent_illegal_exhaustion_stops_without_second_run_action(tmp_path):
+    """PlayerAgent already spent its one correction, so the orchestrator cannot grant another."""
+
+    class ExhaustedIllegalAgent(NightAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            return AgentOutcome(
+                action=None,
+                status="required_action_failed",
+                round_trips=2,
+                illegal_corrections=1,
+            )
+
+    agents = {
+        player_id: NightAgent(player_id)
+        for player_id in ("alice", "bob", "carol", "david", "eve")
+    }
+    agents["david"] = ExhaustedIllegalAgent("david")
+    orchestrator, rules, _history = make_orchestrator(tmp_path, agents)
+    task = asyncio.create_task(orchestrator.run())
+    try:
+        await asyncio.wait_for(orchestrator.wait_until_stopped(), timeout=1)
+
+        assert orchestrator.status().reason == "required_illegal_action_failed"
+        assert len(agents["david"].scenes) == 1
+        assert rules.state.role_state.pending_night_role == "poisoner"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_required_missing_action_has_its_own_single_retry_and_reason(tmp_path):
+    """A valid provider response without a required action is neither provider failure nor fresh correction."""
+
+    class MissingRequiredActionAgent(NightAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            return AgentOutcome(
+                action=None,
+                status="required_action_failed",
+                round_trips=1,
+                illegal_corrections=0,
+            )
+
+    agents = {
+        player_id: NightAgent(player_id)
+        for player_id in ("alice", "bob", "carol", "david", "eve")
+    }
+    agents["david"] = MissingRequiredActionAgent("david")
+    orchestrator, rules, _history = make_orchestrator(tmp_path, agents)
+    task = asyncio.create_task(orchestrator.run())
+    try:
+        await asyncio.wait_for(orchestrator.wait_until_stopped(), timeout=1)
+
+        assert orchestrator.status().reason == "required_action_failed"
+        assert len(agents["david"].scenes) == 2
+        assert rules.state.role_state.pending_night_role == "poisoner"
     finally:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -420,6 +500,79 @@ async def test_discussion_history_failure_stops_then_retries_without_starting_a_
             await task
 
 
+async def test_private_history_failure_continue_retries_same_action_in_same_scene(tmp_path):
+    """Continue resumes the failed private opportunity instead of ending the scene and returning empty."""
+
+    retry_started = asyncio.Event()
+    retry_release = asyncio.Event()
+
+    class PrivateHistoryThenBlockingAgent(NightAgent):
+        private_calls = 0
+
+        async def respond_private_invitation(self, invitation):
+            return "accept"
+
+        async def probe(self, event):
+            self.probes.append(event)
+            if event.phase == "day.private":
+                return ReactionProbe(decision="respond", urgency=5, action_type="speak")
+            return ReactionProbe(decision="silent", urgency=0, action_type="yield")
+
+        async def run_action(self, scene):
+            if scene.purpose != "private_chat":
+                return await super().run_action(scene)
+            self.scenes.append(scene)
+            self.private_calls += 1
+            if self.private_calls == 1:
+                raise HistoryWriteError("private notebook was not durable")
+            retry_started.set()
+            await retry_release.wait()
+            return AgentOutcome(
+                action=SpeakPrivate(
+                    actor=self.player_id,
+                    chat_id=scene.details["chat_id"],
+                    text="recovered once",
+                ),
+                round_trips=1,
+            )
+
+    agents = {
+        player_id: PrivateHistoryThenBlockingAgent(player_id)
+        for player_id in ("alice", "bob", "carol", "david", "eve")
+    }
+    orchestrator, rules, history = make_orchestrator(tmp_path, agents)
+    await orchestrator._commit_events(rules.events)
+    await orchestrator._run_night()
+    task = asyncio.create_task(
+        orchestrator._run_private_chat(
+            RequestPrivateChat(actor="alice", target_player="bob")
+        )
+    )
+    try:
+        await asyncio.wait_for(orchestrator.wait_until_stopped(), timeout=1)
+        chat_id = rules.state.active_scene
+        assert orchestrator.status().reason == "history_write_failed"
+        assert rules.state.phase == "day.private"
+        assert chat_id is not None
+        assert not any(event.type == "chat.private_ended" for event in history.stream.after(0))
+
+        await orchestrator.continue_game()
+        await asyncio.wait_for(retry_started.wait(), timeout=1)
+        assert rules.state.active_scene == chat_id
+        assert sum(agent.private_calls for agent in agents.values()) == 2
+        await orchestrator.request_stop()
+        retry_release.set()
+        await asyncio.wait_for(orchestrator.wait_until_stopped(), timeout=1)
+        messages = [event for event in history.stream.after(0) if event.type == "chat.private_message"]
+        assert len(messages) == 1
+        assert messages[0].payload["chat_id"] == chat_id
+    finally:
+        retry_release.set()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
 async def test_concurrent_continue_requests_reload_model_configuration_once(tmp_path):
     """Continue is one control transition even when two API callers race."""
 
@@ -479,3 +632,108 @@ async def test_concurrent_continue_requests_reload_model_configuration_once(tmp_
             ),
             timeout=1,
         )
+
+
+@dataclass
+class DayBudgetScript:
+    private_requested: bool = False
+    public_calls: int = 0
+    private_calls: int = 0
+    final_probe_ids: list[str] = field(default_factory=list)
+
+
+class DayBudgetAgent(NightAgent):
+    def __init__(self, player_id: str, script: DayBudgetScript):
+        super().__init__(player_id)
+        self.script = script
+
+    async def respond_private_invitation(self, invitation):
+        return "accept"
+
+    async def probe(self, event):
+        self.probes.append(event)
+        if event.type == "day.final_nomination_probe":
+            self.script.final_probe_ids.append(self.player_id)
+            return ReactionProbe(decision="silent", urgency=0, action_type="yield")
+        if event.phase == "day.private":
+            return ReactionProbe(decision="respond", urgency=5, action_type="speak")
+        if not self.script.private_requested:
+            return ReactionProbe(decision="respond", urgency=10, action_type="private_chat")
+        return ReactionProbe(decision="silent", urgency=0, action_type="yield")
+
+    async def run_action(self, scene):
+        if scene.purpose == "public_discussion":
+            self.scenes.append(scene)
+            self.script.public_calls += 1
+            self.script.private_requested = True
+            target = "bob" if self.player_id != "bob" else "alice"
+            return AgentOutcome(
+                action=RequestPrivateChat(actor=self.player_id, target_player=target),
+                round_trips=1,
+            )
+        if scene.purpose == "private_chat":
+            self.scenes.append(scene)
+            self.script.private_calls += 1
+            return AgentOutcome(
+                action=SpeakPrivate(
+                    actor=self.player_id,
+                    chat_id=scene.details["chat_id"],
+                    text=f"private action {self.script.private_calls}",
+                ),
+                round_trips=1,
+            )
+        return await super().run_action(scene)
+
+
+async def test_private_request_that_exhausts_day_budget_goes_directly_to_final_probes(tmp_path):
+    """The request itself is an outward action and cannot defer the hard-limit final sweep."""
+
+    script = DayBudgetScript()
+    agents = {
+        player_id: DayBudgetAgent(player_id, script)
+        for player_id in ("alice", "bob", "carol", "david", "eve")
+    }
+    orchestrator, rules, history = make_orchestrator(
+        tmp_path,
+        agents,
+        discussion_action_budget=1,
+        private_chat_action_budget=5,
+    )
+    await orchestrator._commit_events(rules.events)
+    await orchestrator._run_night()
+
+    await orchestrator._run_day()
+
+    records = history.stream.after(0)
+    assert script.public_calls == 1
+    assert script.private_calls == 0
+    assert not any(event.type == "chat.private_invitation" for event in records)
+    assert len(script.final_probe_ids) == 5
+    assert rules.state.phase == "night"
+
+
+async def test_private_actions_consume_the_same_global_day_budget(tmp_path):
+    """Private actions use only the day owner's remainder and prevent another public action."""
+
+    script = DayBudgetScript()
+    agents = {
+        player_id: DayBudgetAgent(player_id, script)
+        for player_id in ("alice", "bob", "carol", "david", "eve")
+    }
+    orchestrator, rules, history = make_orchestrator(
+        tmp_path,
+        agents,
+        discussion_action_budget=3,
+        private_chat_action_budget=5,
+    )
+    await orchestrator._commit_events(rules.events)
+    await orchestrator._run_night()
+
+    await orchestrator._run_day()
+
+    records = history.stream.after(0)
+    assert script.public_calls == 1
+    assert script.private_calls == 2
+    assert sum(event.type == "chat.private_message" for event in records) == 2
+    assert len(script.final_probe_ids) == 5
+    assert rules.state.phase == "night"

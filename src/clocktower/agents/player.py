@@ -498,7 +498,7 @@ class PlayerAgent:
             for event in source_events
             if event.seq == 0 or event.seq > self.state.event_cursor
         )
-        candidate_events = (*new_events, *context_events)
+        candidate_events = self._deduplicate_events((*new_events, *context_events))
         if private_context_only:
             participant_ids = (
                 frozenset(participants)
@@ -526,6 +526,18 @@ class PlayerAgent:
                 update={"tools": tuple(tool for tool in context.tools if tool.name in allowed)}
             )
         return context, new_events
+
+    @staticmethod
+    def _deduplicate_events(events: Sequence[EventRecord]) -> tuple[EventRecord, ...]:
+        unique: list[EventRecord] = []
+        seen: set[str] = set()
+        for event in events:
+            identity = event.model_dump_json(exclude={"seq"})
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unique.append(event)
+        return tuple(unique)
 
     @staticmethod
     def _action_messages(

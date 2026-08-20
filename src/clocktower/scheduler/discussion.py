@@ -80,19 +80,16 @@ class DiscussionScheduler:
             return []
         state = self._state_provider()
         if state.stopped:
-            events = [self._stop_event()]
-            await self._emit(events)
+            events = list(await self._emit((self._stop_event(),)))
             return events
         if self.action_count >= self.action_budget:
-            events = [self._end("action_budget")]
-            await self._emit(events)
+            events = list(await self._emit((self._end("action_budget"),)))
             return events
 
         if not is_safe_public_event(self.trigger_event) or not state.phase.startswith("day.discussion"):
             self._increment_quiet()
             events = self._quiet_events([])
-            await self._emit(events)
-            return events
+            return list(await self._emit(events))
 
         base_scores = score_candidates(
             self.trigger_event,
@@ -105,20 +102,22 @@ class DiscussionScheduler:
             ),
         )
         self.initial_ranking = tuple(score.player_id for score in base_scores)
-        events = [self._ranking_event(base_scores)]
-        await self._emit(events)
+        events = list(await self._emit((self._ranking_event(base_scores),)))
+        await self._at_safe_point()
+        if self._state_provider().stopped:
+            stopped = self._stop_event()
+            events.extend(await self._emit((stopped,)))
+            return events
         if not base_scores:
             self._increment_quiet()
-            quiet_events = self._quiet_events(base_scores)
-            await self._emit(quiet_events)
+            quiet_events = list(await self._emit(self._quiet_events(base_scores)))
             return events + quiet_events
 
         adjusted_scores, probe_events = await self._probe_top_two(base_scores)
         events.extend(probe_events)
         if self._state_provider().stopped:
             stopped = self._stop_event()
-            events.append(stopped)
-            await self._emit((stopped,))
+            events.extend(await self._emit((stopped,)))
             return events
         eligible = [
             score
@@ -132,22 +131,24 @@ class DiscussionScheduler:
         self._selection_number += 1
         if selected_id is None:
             self._increment_quiet()
-            quiet_events = self._quiet_events(adjusted_scores)
-            await self._emit(quiet_events)
+            quiet_events = list(await self._emit(self._quiet_events(adjusted_scores)))
             return events + quiet_events
 
         selected_score = next(score for score in adjusted_scores if score.player_id == selected_id)
         selection_event = self._selection_event(selected_score)
-        events.append(selection_event)
-        await self._emit((selection_event,))
+        events.extend(await self._emit((selection_event,)))
+        await self._at_safe_point()
+        if self._state_provider().stopped:
+            stopped = self._stop_event()
+            events.extend(await self._emit((stopped,)))
+            return events
         agent = self.agents.get(selected_id)
         if agent is None:
             self._increment_quiet()
             rejected = self._observer_event("scheduler.action_rejected", {"player_id": selected_id, "reason": "missing_agent"})
             quiet_events = self._quiet_events(adjusted_scores)
-            events.append(rejected)
-            await self._emit((rejected, *quiet_events))
-            return events + quiet_events
+            rejected_events = list(await self._emit((rejected, *quiet_events)))
+            return events + rejected_events
 
         scene = AgentScene(
             phase="day.discussion",
@@ -165,8 +166,7 @@ class DiscussionScheduler:
             await self._at_safe_point()
             if self._state_provider().stopped:
                 stopped = self._stop_event()
-                await self._emit((stopped,))
-                return events + [stopped]
+                return events + list(await self._emit((stopped,)))
             try:
                 outcome = await agent.run_action(scene)
             except ModelCallError:
@@ -174,15 +174,15 @@ class DiscussionScheduler:
                 yielded_events = self.rules.apply_action(
                     YieldAction(actor=selected_id, reason="model_call_failed")
                 )
-                failed_events = [
+                failed_events = list(await self._emit((
                     self._observer_event(
                         "scheduler.normal_action_failed",
                         {"player_id": selected_id, "reason": "model_call_failed_after_retry"},
                     ),
                     *yielded_events,
                     *self._quiet_events([]),
-                ]
-                await self._emit(failed_events)
+                )))
+                self._update_public_trigger(failed_events)
                 await self._at_safe_point()
                 return events + failed_events
         outcome_events = await self._apply_with_rule_correction(
@@ -204,13 +204,11 @@ class DiscussionScheduler:
         try:
             outcome_events = self._apply_outcome(selected_id, outcome)
         except IllegalAction as first_error:
-            correction = self._tool_error(selected_id, first_error)
-            await self._emit((correction,))
+            correction = (await self._emit((self._tool_error(selected_id, first_error),)))[0]
             await self._at_safe_point()
             if self._state_provider().stopped:
                 stopped = self._stop_event()
-                await self._emit((stopped,))
-                return [correction, stopped]
+                return [correction, *(await self._emit((stopped,)))]
 
             corrected: AgentOutcome | None = None
             for attempt in range(2):
@@ -221,15 +219,15 @@ class DiscussionScheduler:
                         await self._at_safe_point()
                         if self._state_provider().stopped:
                             stopped = self._stop_event()
-                            await self._emit((stopped,))
-                            return [correction, stopped]
+                            return [correction, *(await self._emit((stopped,)))]
                         continue
                     failure_events = self._optional_failure_events(
                         selected_id,
                         reason="model_call_failed_after_retry",
                     )
-                    await self._emit(failure_events)
-                    return [correction, *failure_events]
+                    committed_failures = list(await self._emit(failure_events))
+                    self._update_public_trigger(committed_failures)
+                    return [correction, *committed_failures]
                 break
 
             if corrected is None:
@@ -237,8 +235,9 @@ class DiscussionScheduler:
                     selected_id,
                     reason="missing_correction",
                 )
-                await self._emit(failure_events)
-                return [correction, *failure_events]
+                committed_failures = list(await self._emit(failure_events))
+                self._update_public_trigger(committed_failures)
+                return [correction, *committed_failures]
             try:
                 outcome_events = self._apply_outcome(selected_id, corrected)
             except IllegalAction as second_error:
@@ -256,11 +255,13 @@ class DiscussionScheduler:
                     ),
                     *self._quiet_events([]),
                 ]
-            await self._emit(outcome_events)
-            return [correction, *outcome_events]
+            committed_outcome = list(await self._emit(outcome_events))
+            self._update_public_trigger(committed_outcome)
+            return [correction, *committed_outcome]
 
-        await self._emit(outcome_events)
-        return outcome_events
+        committed_outcome = list(await self._emit(outcome_events))
+        self._update_public_trigger(committed_outcome)
+        return committed_outcome
 
     def _optional_failure_events(self, player_id: str, *, reason: str) -> list[EventRecord]:
         self._increment_quiet()
@@ -312,17 +313,19 @@ class DiscussionScheduler:
                     adjustment, decision = _bounded_adjustment(probe)
                     break
             adjustments[score.player_id] = adjustment
-            audit_events.append(
-                self._observer_event(
+            committed_audit = await self._emit(
+                (
+                    self._observer_event(
                     "scheduler.probe_adjustment",
                     {
                         "player_id": score.player_id,
                         "decision": decision,
                         "urgency_adjustment": adjustment,
                     },
+                    ),
                 )
             )
-            await self._emit((audit_events[-1],))
+            audit_events.extend(committed_audit)
             await self._at_safe_point()
         self.probe_adjustments = adjustments
         return (
@@ -370,9 +373,6 @@ class DiscussionScheduler:
         self.action_counts[selected_id] = self.action_counts.get(selected_id, 0) + 1
         self.last_speaker = selected_id
         self.quiet_count = 0
-        public_events = [event for event in rule_events if is_safe_public_event(event)]
-        if public_events:
-            self.trigger_event = public_events[-1]
         events = list(rule_events)
         if self.action_count >= self.action_budget:
             events.append(self._end("action_budget"))
@@ -467,9 +467,23 @@ class DiscussionScheduler:
             },
         )
 
-    async def _emit(self, events: Sequence[EventRecord]) -> None:
-        if self._event_sink is not None and events:
-            await self._event_sink(tuple(events))
+    async def _emit(self, events: Sequence[EventRecord]) -> tuple[EventRecord, ...]:
+        drafts = tuple(events)
+        if self._event_sink is None or not drafts:
+            return drafts
+        result = await self._event_sink(drafts)
+        if (
+            isinstance(result, Sequence)
+            and len(result) == len(drafts)
+            and all(isinstance(event, EventRecord) for event in result)
+        ):
+            return tuple(result)
+        return drafts
+
+    def _update_public_trigger(self, events: Sequence[EventRecord]) -> None:
+        public_events = [event for event in events if is_safe_public_event(event)]
+        if public_events:
+            self.trigger_event = public_events[-1]
 
     async def _at_safe_point(self) -> None:
         if self._safe_point is not None:

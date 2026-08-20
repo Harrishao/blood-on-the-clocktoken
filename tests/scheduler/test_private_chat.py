@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 
 import pytest
@@ -211,6 +212,164 @@ async def test_orchestrator_sink_commits_private_transcript_once_at_each_causal_
     assert sum(event.type == "chat.private_message" for event in returned) == 1
 
 
+async def test_committed_private_message_replaces_seq_zero_transcript_draft():
+    """The next participant receives one durable transcript record, while no-sink mode stays local."""
+
+    next_seq = 200
+
+    async def event_sink(events):
+        nonlocal next_seq
+        committed = tuple(
+            event.model_copy(update={"seq": next_seq + index})
+            for index, event in enumerate(events)
+        )
+        next_seq += len(committed)
+        return committed
+
+    scheduler, _state, agents = make_scheduler(
+        action_budget=2,
+        event_sink=event_sink,
+    )
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    assert all(event.seq > 0 for event in request.events)
+    chat_id = request.scene.chat_id
+    agents["alice"].probe_result = ReactionProbe(decision="respond", urgency=15, action_type="speak")
+    agents["bob"].probe_result = ReactionProbe(decision="respond", urgency=-15, action_type="speak")
+    agents["alice"].actions = [
+        SpeakPrivate(actor="alice", chat_id=chat_id, text="one durable secret")
+    ]
+    agents["bob"].actions = [LeavePrivateChat(actor="bob", chat_id=chat_id)]
+
+    returned = await scheduler.run(chat_id)
+
+    assert all(event.seq > 0 for event in returned)
+    assert len(request.scene.transcript) == 1
+    assert request.scene.transcript[0].seq > 0
+    bob_scene = agents["bob"].scenes[0]
+    assert bob_scene.context_events == tuple(request.scene.transcript)
+
+
+async def test_stop_arriving_during_invitation_sink_prevents_invitee_model_call():
+    """The private invitation must be durable before consent inference is allowed to start."""
+
+    invitation_started = asyncio.Event()
+    invitation_release = asyncio.Event()
+    stop_requested = False
+
+    async def event_sink(events):
+        if any(event.type == "chat.private_invitation" for event in events):
+            invitation_started.set()
+            await invitation_release.wait()
+        return tuple(events)
+
+    async def safe_point():
+        if stop_requested:
+            state.stopped = True
+
+    scheduler, state, agents = make_scheduler(
+        event_sink=event_sink,
+        safe_point=safe_point,
+    )
+    task = asyncio.create_task(scheduler.request("alice", "bob"))
+    try:
+        await asyncio.wait_for(invitation_started.wait(), timeout=1)
+        stop_requested = True
+        invitation_release.set()
+        result = await asyncio.wait_for(task, timeout=1)
+
+        assert agents["bob"].invitations == []
+        assert result.scene is None
+        assert state.active_scene is None
+    finally:
+        invitation_release.set()
+        if not task.done():
+            task.cancel()
+
+
+async def test_stop_arriving_during_private_ranking_sink_prevents_any_probe():
+    """Private ranking persistence is the safe boundary before participant probes."""
+
+    ranking_started = asyncio.Event()
+    ranking_release = asyncio.Event()
+    stop_requested = False
+
+    async def event_sink(events):
+        if any(event.type == "scheduler.ranking" for event in events):
+            ranking_started.set()
+            await ranking_release.wait()
+        return tuple(
+            event.model_copy(update={"seq": index + 30})
+            for index, event in enumerate(events)
+        )
+
+    async def safe_point():
+        if stop_requested:
+            state.stopped = True
+
+    scheduler, state, agents = make_scheduler(
+        event_sink=event_sink,
+        safe_point=safe_point,
+    )
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    task = asyncio.create_task(scheduler.run(request.scene.chat_id))
+    try:
+        await asyncio.wait_for(ranking_started.wait(), timeout=1)
+        stop_requested = True
+        ranking_release.set()
+        events = await asyncio.wait_for(task, timeout=1)
+
+        assert all(not agent.probes and not agent.scenes for agent in agents.values())
+        assert any(event.type == "scheduler.stopped" for event in events)
+    finally:
+        ranking_release.set()
+        if not task.done():
+            task.cancel()
+
+
+async def test_stop_arriving_during_private_selection_sink_prevents_normal_model_call():
+    """A private selection cannot start its normal model before owner stop is observed."""
+
+    selection_started = asyncio.Event()
+    selection_release = asyncio.Event()
+    stop_requested = False
+
+    async def event_sink(events):
+        if any(event.type == "scheduler.selection" for event in events):
+            selection_started.set()
+            await selection_release.wait()
+        return tuple(
+            event.model_copy(update={"seq": index + 40})
+            for index, event in enumerate(events)
+        )
+
+    async def safe_point():
+        if stop_requested:
+            state.stopped = True
+
+    scheduler, state, agents = make_scheduler(
+        event_sink=event_sink,
+        safe_point=safe_point,
+    )
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    task = asyncio.create_task(scheduler.run(request.scene.chat_id))
+    try:
+        await asyncio.wait_for(selection_started.wait(), timeout=1)
+        stop_requested = True
+        selection_release.set()
+        events = await asyncio.wait_for(task, timeout=1)
+
+        assert sum(len(agent.probes) for agent in agents.values()) == 2
+        assert all(not agent.scenes for agent in agents.values())
+        assert any(event.type == "scheduler.stopped" for event in events)
+    finally:
+        selection_release.set()
+        if not task.done():
+            task.cancel()
+
+
 async def test_private_candidates_and_normal_actions_are_limited_to_participants():
     """A third player must not be probed, prompted, or accepted inside the subscene."""
 
@@ -300,6 +459,162 @@ async def test_history_write_failure_from_private_calls_is_not_swallowed():
 
     with pytest.raises(HistoryWriteError, match="disk failed"):
         await scheduler.request("alice", "bob")
+
+
+async def test_private_action_history_failure_preserves_scene_and_retries_same_selection():
+    """A notebook/history failure may pause one action opportunity but cannot close or replay its audits."""
+
+    emitted: list[EventRecord] = []
+
+    async def event_sink(events):
+        emitted.extend(events)
+        return tuple(events)
+
+    scheduler, state, agents = make_scheduler(
+        action_budget=1,
+        event_sink=event_sink,
+    )
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    chat_id = request.scene.chat_id
+    for player_id in ("alice", "bob"):
+        agents[player_id].actions = [
+            HistoryWriteError("notebook batch failed"),
+            SpeakPrivate(actor=player_id, chat_id=chat_id, text=f"{player_id} recovered"),
+        ]
+
+    with pytest.raises(HistoryWriteError, match="notebook batch failed"):
+        await scheduler.run(chat_id)
+
+    selected = next(
+        event.payload["player_id"]
+        for event in emitted
+        if event.type == "scheduler.selection"
+    )
+    assert state.phase == "day.private"
+    assert state.active_scene == chat_id
+    assert scheduler._scene is request.scene
+    assert scheduler.end_reason is None
+    assert not any(event.type == "chat.private_ended" for event in emitted)
+
+    recovered = await scheduler.run(chat_id)
+
+    assert len(agents[selected].scenes) == 2
+    assert sum(event.type == "chat.private_started" for event in emitted) == 1
+    assert sum(event.type == "scheduler.ranking" for event in emitted) == 1
+    assert sum(event.type == "scheduler.selection" for event in emitted) == 1
+    assert sum(event.type == "chat.private_message" for event in emitted) == 1
+    assert sum(event.type == "chat.private_message" for event in recovered) == 1
+
+
+async def test_private_probe_history_failure_resumes_without_replaying_ranking_or_prior_probe():
+    """Probe persistence failure retries that participant, not the already committed scene prefix."""
+
+    emitted: list[EventRecord] = []
+
+    async def event_sink(events):
+        emitted.extend(events)
+        return tuple(events)
+
+    scheduler, state, agents = make_scheduler(
+        action_budget=1,
+        event_sink=event_sink,
+    )
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    chat_id = request.scene.chat_id
+    agents["alice"].probe_result = ReactionProbe(
+        decision="respond", urgency=15, action_type="speak"
+    )
+    agents["bob"].probe_result = [
+        HistoryWriteError("probe segment failed"),
+        ReactionProbe(decision="respond", urgency=-15, action_type="speak"),
+    ]
+    agents["alice"].actions = [
+        SpeakPrivate(actor="alice", chat_id=chat_id, text="after probe recovery")
+    ]
+
+    with pytest.raises(HistoryWriteError, match="probe segment failed"):
+        await scheduler.run(chat_id)
+
+    assert state.phase == "day.private"
+    assert sum(event.type == "scheduler.ranking" for event in emitted) == 1
+    assert len(agents["alice"].probes) == 1
+    assert len(agents["bob"].probes) == 1
+    assert sum(event.type == "scheduler.probe_adjustment" for event in emitted) == 1
+
+    await scheduler.run(chat_id)
+
+    assert sum(event.type == "scheduler.ranking" for event in emitted) == 1
+    assert len(agents["alice"].probes) == 1
+    assert len(agents["bob"].probes) == 2
+    assert sum(event.type == "scheduler.probe_adjustment" for event in emitted) == 2
+    assert sum(event.type == "chat.private_message" for event in emitted) == 1
+
+
+async def test_unknown_private_action_exception_preserves_scene_without_false_end():
+    """Programming failures must propagate without manufacturing model_failed or ended facts."""
+
+    emitted: list[EventRecord] = []
+
+    async def event_sink(events):
+        emitted.extend(events)
+        return tuple(events)
+
+    scheduler, state, agents = make_scheduler(event_sink=event_sink)
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    for player_id in ("alice", "bob"):
+        agents[player_id].actions = [RuntimeError("programming defect")]
+
+    with pytest.raises(RuntimeError, match="programming defect"):
+        await scheduler.run(request.scene.chat_id)
+
+    assert state.phase == "day.private"
+    assert state.active_scene == request.scene.chat_id
+    assert scheduler._scene is request.scene
+    assert scheduler.end_reason is None
+    assert not any(event.type == "chat.private_ended" for event in emitted)
+
+
+async def test_cancelled_private_action_preserves_scene_without_ended_shell():
+    """Task cancellation is not a gameplay end reason and must leave resumable ownership intact."""
+
+    action_started = asyncio.Event()
+    action_release = asyncio.Event()
+    emitted: list[EventRecord] = []
+
+    async def event_sink(events):
+        emitted.extend(events)
+        return tuple(events)
+
+    class BlockingPrivateAgent(ScriptedPrivateAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            action_started.set()
+            await action_release.wait()
+            return AgentOutcome(action=YieldAction(actor="alice", reason="cancelled"), round_trips=1)
+
+    scheduler, state, agents = make_scheduler(event_sink=event_sink)
+    request = await scheduler.request("alice", "bob")
+    assert request.scene is not None
+    agents["alice"] = BlockingPrivateAgent()
+    agents["bob"] = BlockingPrivateAgent()
+    scheduler.agents = agents
+    task = asyncio.create_task(scheduler.run(request.scene.chat_id))
+    try:
+        await asyncio.wait_for(action_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert state.phase == "day.private"
+        assert state.active_scene == request.scene.chat_id
+        assert scheduler._scene is request.scene
+        assert scheduler.end_reason is None
+        assert not any(event.type == "chat.private_ended" for event in emitted)
+    finally:
+        action_release.set()
 
 
 async def test_private_transcript_reaches_the_other_participant_without_pretending_it_was_persisted():

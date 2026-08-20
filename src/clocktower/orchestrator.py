@@ -210,6 +210,8 @@ class GameOrchestrator:
             event_sink=self._commit_events,
             safe_point=self._safe_point,
         )
+        day_action_count = 0
+        last_discussion_action_count = 0
 
         while (
             self.rules.state.phase.startswith("day")
@@ -217,15 +219,30 @@ class GameOrchestrator:
             and scheduler.end_reason is None
         ):
             await self._safe_point()
+            remaining = max(
+                0,
+                self.game_config.discussion_action_budget - day_action_count,
+            )
+            scheduler.action_budget = scheduler.action_count + remaining
             try:
                 events = await scheduler.step()
             except HistoryWriteError:
                 await self._pause_until_continue("history_write_failed")
                 continue
+            day_action_count += scheduler.action_count - last_discussion_action_count
+            last_discussion_action_count = scheduler.action_count
             private_request = scheduler.pending_private_request
             scheduler.pending_private_request = None
-            if private_request is not None:
-                private_events = await self._run_private_chat(private_request)
+            remaining = max(
+                0,
+                self.game_config.discussion_action_budget - day_action_count,
+            )
+            if private_request is not None and remaining > 0:
+                private_events, private_action_count = await self._run_private_chat(
+                    private_request,
+                    action_budget=remaining,
+                )
+                day_action_count += private_action_count
                 public_shells = [event for event in private_events if event.audience.kind == "public"]
                 if public_shells:
                     scheduler.trigger_event = public_shells[-1]
@@ -246,7 +263,12 @@ class GameOrchestrator:
         await self._safe_point()
         await self._commit_events(self.rules.end_day())
 
-    async def _run_private_chat(self, action: RequestPrivateChat) -> list[EventRecord]:
+    async def _run_private_chat(
+        self,
+        action: RequestPrivateChat,
+        *,
+        action_budget: int | None = None,
+    ) -> tuple[list[EventRecord], int]:
         while True:
             try:
                 request = await self._private_scheduler.request(
@@ -266,15 +288,23 @@ class GameOrchestrator:
                         ),
                     )
                 )
-                return []
+                return [], 0
             break
         if request.scene is None:
-            return list(request.events)
+            return list(request.events), 0
+        configured_budget = self._private_scheduler.action_budget
+        if action_budget is not None:
+            self._private_scheduler.action_budget = min(configured_budget, action_budget)
         try:
-            return await self._private_scheduler.run(request.scene.chat_id)
-        except HistoryWriteError:
-            await self._pause_until_continue("history_write_failed")
-            return []
+            while True:
+                try:
+                    events = await self._private_scheduler.run(request.scene.chat_id)
+                except HistoryWriteError:
+                    await self._pause_until_continue("history_write_failed")
+                    continue
+                return events, request.scene.action_count
+        finally:
+            self._private_scheduler.action_budget = configured_budget
 
     async def _run_nomination(self) -> EventRecord | None:
         opened = self._latest_rule_event("nomination.opened")
@@ -477,13 +507,18 @@ class GameOrchestrator:
     ) -> None:
         while True:
             agent = self.agents.get(player_id)
-            call_failures = 0
+            provider_failures = 0
+            missing_action_failures = 0
             correction_used = False
+            stop_reason = "required_action_failed"
             while True:
                 await self._safe_point()
                 outcome: AgentOutcome | None = None
                 if agent is None:
-                    call_failure = True
+                    missing_action_failures += 1
+                    if missing_action_failures < 2:
+                        continue
+                    break
                 else:
                     while True:
                         try:
@@ -492,22 +527,32 @@ class GameOrchestrator:
                             await self._pause_until_continue("history_write_failed")
                             continue
                         except ModelCallError:
-                            call_failure = True
-                        else:
-                            call_failure = (
-                                outcome.status == "required_action_failed"
-                                or outcome.action is None
-                            )
+                            provider_failures += 1
+                            if provider_failures >= 2:
+                                stop_reason = "required_model_call_failed"
                         break
 
-                if call_failure:
-                    call_failures += 1
-                    if call_failures < 2:
+                if outcome is None:
+                    if provider_failures < 2:
                         continue
                     break
 
-                call_failures = 0
-                action = outcome.action if outcome is not None else None
+                provider_failures = 0
+                if (
+                    outcome.status == "required_action_failed"
+                    and outcome.illegal_corrections > 0
+                ):
+                    stop_reason = "required_illegal_action_failed"
+                    break
+                if outcome.status == "required_action_failed" or outcome.action is None:
+                    missing_action_failures += 1
+                    if missing_action_failures < 2:
+                        continue
+                    stop_reason = "required_action_failed"
+                    break
+
+                missing_action_failures = 0
+                action = outcome.action
                 failure: IllegalAction | None = None
                 if not accepts(action):
                     failure = IllegalAction("required action was not completed")
@@ -533,6 +578,7 @@ class GameOrchestrator:
                         )
                     )
                     continue
+                stop_reason = "required_illegal_action_failed"
                 break
 
             await self._commit_events(
@@ -542,11 +588,15 @@ class GameOrchestrator:
                         type="orchestrator.required_action_failed",
                         actor=player_id,
                         audience=Audience.observer(),
-                        payload={"player_id": player_id, "purpose": scene.purpose},
+                        payload={
+                            "player_id": player_id,
+                            "purpose": scene.purpose,
+                            "reason": stop_reason,
+                        },
                     ),
                 )
             )
-            await self._pause_until_continue("required_model_call_failed")
+            await self._pause_until_continue(stop_reason)
 
     def _pending_night_details(self, actor_id: str, role: str) -> dict[str, Any]:
         for event in reversed(self.rules.events):

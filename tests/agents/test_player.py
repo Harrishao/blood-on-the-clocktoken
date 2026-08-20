@@ -1121,3 +1121,46 @@ async def test_private_scene_context_events_require_the_current_chat_id(tmp_path
 
     prompt = json.loads(adapter.requests[0].messages[1]["content"])
     assert [event["payload"]["text"] for event in prompt["events"]] == ["current secret"]
+
+
+async def test_private_scene_deduplicates_same_committed_event_from_stream_and_transcript(tmp_path):
+    """A committed chat message may be in both sources but must appear only once in the prompt."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "speak_private",
+                {"chat_id": "chat-current", "text": "reply"},
+                call_id="private-dedup-1",
+            ),
+        )
+    )
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+    game_state.phase = "day.private"
+    committed = await history.append(
+        EventRecord(
+            phase="day.private",
+            type="chat.private_message",
+            audience=Audience.players({"alice", "bob"}),
+            payload={"chat_id": "chat-current", "text": "one durable secret"},
+        )
+    )
+
+    await agent.run_action(
+        AgentScene(
+            phase="day.private",
+            allowed_tools=("speak_private", "leave_private_chat", "update_notebook", "yield_action"),
+            private_context_only=True,
+            context_events=(committed,),
+            details={"chat_id": "chat-current", "participants": ["alice", "bob"]},
+        )
+    )
+
+    prompt = json.loads(adapter.requests[0].messages[1]["content"])
+    matching = [
+        event
+        for event in prompt["events"]
+        if event["payload"].get("text") == "one durable secret"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["seq"] == committed.seq

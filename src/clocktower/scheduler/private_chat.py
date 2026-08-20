@@ -29,6 +29,10 @@ class PrivateChatScene:
     action_counts: dict[str, int] = field(default_factory=dict)
     quiet_player_ids: set[str] = field(default_factory=set)
     transcript: list[EventRecord] = field(default_factory=list)
+    pending_player_id: str | None = None
+    pending_scores: tuple[CandidateScore, ...] = ()
+    pending_probe_index: int = 0
+    pending_probe_adjustments: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -84,30 +88,43 @@ class PrivateChatScheduler:
             self._validate_request(state, inviter, invitee)
             self._request_number += 1
             request_id = f"private-request-{state.seed}-{self._request_number}"
-            invitation = EventRecord(
+            invitation = (await self._emit((EventRecord(
                 phase="day.private_invite",
                 type="chat.private_invitation",
                 actor=inviter,
                 audience=Audience.player(invitee),
                 payload={"request_id": request_id, "inviter": inviter},
-            )
-            await self._emit((invitation,))
+            ),)))[0]
+            await self._at_safe_point()
+            if self._state_provider().stopped:
+                return PrivateChatRequest(
+                    request_id=request_id,
+                    decision="defer",
+                    scene=None,
+                    events=(invitation,),
+                )
             decision = await self._request_decision(invitee, invitation)
             if decision == "accept" and not self._can_accept_after_wait(inviter, invitee):
                 decision = "defer"
-            response = EventRecord(
+            response = (await self._emit((EventRecord(
                 phase="day.private_invite",
                 type="chat.private_response",
                 actor=invitee,
                 audience=Audience.player(invitee),
                 payload={"request_id": request_id, "decision": decision},
-            )
-            await self._emit((response,))
+            ),)))[0]
+            await self._at_safe_point()
             if decision != "accept":
-                await self._at_safe_point()
                 return PrivateChatRequest(
                     request_id=request_id,
                     decision=decision,
+                    scene=None,
+                    events=(invitation, response),
+                )
+            if self._state_provider().stopped:
+                return PrivateChatRequest(
+                    request_id=request_id,
+                    decision="defer",
                     scene=None,
                     events=(invitation, response),
                 )
@@ -140,70 +157,94 @@ class PrivateChatScheduler:
             if scene is None or scene.chat_id != chat_id:
                 raise ValueError("chat_id does not identify the active private scene")
             state = self._state_provider()
-            if state.active_scene != chat_id or state.phase != scene.parent_phase:
+            if state.active_scene != chat_id or state.phase not in {
+                scene.parent_phase,
+                "day.private",
+            }:
                 self._end(scene, "ownership_lost")
-                self._release_reservation(scene)
                 ended = self._public_shell("chat.private_ended", scene)
-                await self._emit((ended,))
-                return [ended]
-            state.phase = "day.private"
-            events: list[EventRecord] = [self._public_shell("chat.private_started", scene)]
-            await self._emit(events)
-            try:
-                while self.end_reason is None:
-                    current_state = self._state_provider()
-                    if not self._owns(scene):
-                        self._end(scene, "ownership_lost")
-                        break
-                    if current_state.stopped:
-                        stopped = self._observer_event("scheduler.stopped", scene)
-                        events.append(stopped)
-                        await self._emit((stopped,))
-                        self._end(scene, "stopped")
-                        break
-                    if scene.action_count >= self.action_budget:
-                        self._end(scene, "action_budget")
-                        break
+                committed = list(await self._emit((ended,)))
+                self._release_reservation(scene)
+                return committed
+            events: list[EventRecord] = []
+            if state.phase == scene.parent_phase:
+                state.phase = "day.private"
+                started = self._public_shell("chat.private_started", scene)
+                events.extend(await self._emit((started,)))
+                await self._at_safe_point()
 
+            while self.end_reason is None:
+                current_state = self._state_provider()
+                if not self._owns(scene):
+                    self._end(scene, "ownership_lost")
+                    break
+                if current_state.stopped:
+                    stopped = self._observer_event("scheduler.stopped", scene)
+                    events.extend(await self._emit((stopped,)))
+                    self._end(scene, "stopped")
+                    break
+                if scene.action_count >= self.action_budget:
+                    self._end(scene, "action_budget")
+                    break
+
+                if scene.pending_player_id is not None:
+                    selected = scene.pending_player_id
+                    action_events = await self._run_one_action(scene, selected)
+                    committed_action = await self._emit(action_events)
+                    events.extend(committed_action)
+                    self._append_committed_transcript(scene, committed_action)
+                    scene.pending_player_id = None
+                    await self._at_safe_point()
+                    continue
+
+                if scene.pending_scores:
+                    scores = list(scene.pending_scores)
+                else:
                     scores = self._score_participants(scene)
                     if not scores:
                         self._end(scene, "quiet" if self._all_quiet(scene) else "per_player_action_limit")
                         break
                     ranking = self._ranking_event(scene, scores)
-                    events.append(ranking)
-                    await self._emit((ranking,))
-                    adjusted, probe_events = await self._probe_top_two(scene, scores)
-                    events.extend(probe_events)
-                    if not self._owns(scene):
-                        self._end(scene, "ownership_lost")
-                        break
+                    events.extend(await self._emit((ranking,)))
+                    scene.pending_scores = tuple(scores)
+                    scene.pending_probe_index = 0
+                    scene.pending_probe_adjustments.clear()
+                    await self._at_safe_point()
                     if self._state_provider().stopped:
                         stopped = self._observer_event("scheduler.stopped", scene)
-                        events.append(stopped)
-                        await self._emit((stopped,))
+                        events.extend(await self._emit((stopped,)))
                         self._end(scene, "stopped")
                         break
-                    selected = self._choose(scene, adjusted)
-                    if selected is None:
-                        self._end(scene, "quiet" if self._all_quiet(scene) else "per_player_action_limit")
-                        quiet_events = self._quiet_events(scene, adjusted)
-                        events.extend(quiet_events)
-                        await self._emit(quiet_events)
-                        continue
-                    selection = self._selection_event(scene, selected)
-                    events.append(selection)
-                    await self._emit((selection,))
-                    action_events = await self._run_one_action(scene, selected)
-                    events.extend(action_events)
-                    await self._emit(action_events)
+                adjusted, probe_events = await self._probe_top_two(scene, scores)
+                events.extend(probe_events)
+                if not self._owns(scene):
+                    self._end(scene, "ownership_lost")
+                    break
+                if self._state_provider().stopped:
+                    stopped = self._observer_event("scheduler.stopped", scene)
+                    events.extend(await self._emit((stopped,)))
+                    self._end(scene, "stopped")
+                    break
+                selected = self._choose(scene, adjusted)
+                if selected is None:
+                    self._end(scene, "quiet" if self._all_quiet(scene) else "per_player_action_limit")
+                    quiet_events = self._quiet_events(scene, adjusted)
+                    events.extend(await self._emit(quiet_events))
                     await self._at_safe_point()
-            finally:
-                if self.end_reason is None:
-                    self._end(scene, "model_failed")
-                self._release_reservation(scene)
-                ended = self._public_shell("chat.private_ended", scene)
-                events.append(ended)
-                await self._emit((ended,))
+                    continue
+                selection = self._selection_event(scene, selected)
+                events.extend(await self._emit((selection,)))
+                await self._at_safe_point()
+                if self._state_provider().stopped:
+                    stopped = self._observer_event("scheduler.stopped", scene)
+                    events.extend(await self._emit((stopped,)))
+                    self._end(scene, "stopped")
+                    break
+                scene.pending_player_id = selected
+
+            ended = self._public_shell("chat.private_ended", scene)
+            events.extend(await self._emit((ended,)))
+            self._release_reservation(scene)
             return events
 
     def _validate_request(self, state: GameState, inviter: str, invitee: str) -> None:
@@ -324,11 +365,13 @@ class PrivateChatScheduler:
         scene: PrivateChatScene,
         scores: list[CandidateScore],
     ) -> tuple[list[CandidateScore], list[EventRecord]]:
-        self.probed_player_ids = tuple(score.player_id for score in scores[:2])
-        adjustments: dict[str, int] = {}
+        probe_scores = scores[:2]
+        self.probed_player_ids = tuple(score.player_id for score in probe_scores)
+        adjustments = scene.pending_probe_adjustments
         events: list[EventRecord] = []
         trigger = self._private_trigger(scene)
-        for score in scores[:2]:
+        for index in range(scene.pending_probe_index, len(probe_scores)):
+            score = probe_scores[index]
             if self._state_provider().stopped or not self._owns(scene):
                 break
             adjustment = 0
@@ -365,17 +408,25 @@ class PrivateChatScheduler:
             if decision == "silent":
                 self._mark_quiet(scene, score.player_id)
             adjustments[score.player_id] = adjustment
-            events.append(
-                self._observer_event(
+            committed_audit = await self._emit(
+                (
+                    self._observer_event(
                     "scheduler.probe_adjustment",
                     scene,
                     {"player_id": score.player_id, "decision": decision, "urgency_adjustment": adjustment},
+                    ),
                 )
             )
-            await self._emit((events[-1],))
+            events.extend(committed_audit)
+            scene.pending_probe_index = index + 1
             await self._at_safe_point()
-        self.probe_adjustments = adjustments
-        return ([score.with_probe_adjustment(adjustments.get(score.player_id, 0)) for score in scores], events)
+        self.probe_adjustments = dict(adjustments)
+        adjusted = [score.with_probe_adjustment(adjustments.get(score.player_id, 0)) for score in scores]
+        if scene.pending_probe_index >= len(probe_scores):
+            scene.pending_scores = ()
+            scene.pending_probe_index = 0
+            scene.pending_probe_adjustments = {}
+        return adjusted, events
 
     async def _run_one_action(self, scene: PrivateChatScene, player_id: str) -> list[EventRecord]:
         agent = self.agents.get(player_id)
@@ -459,6 +510,9 @@ class PrivateChatScheduler:
             self._mark_quiet(scene, player_id)
             return self._quiet_events(scene, [])
         if isinstance(action, LeavePrivateChat) and action.actor == player_id and action.chat_id == scene.chat_id:
+            scene.action_count += 1
+            scene.action_counts[player_id] = scene.action_counts.get(player_id, 0) + 1
+            scene.last_speaker = player_id
             self._end(scene, "left")
             return [self._observer_event("scheduler.private_left", scene, {"player_id": player_id})]
         if isinstance(action, SpeakPrivate) and action.actor == player_id and action.chat_id == scene.chat_id:
@@ -474,7 +528,6 @@ class PrivateChatScheduler:
                     payload={"chat_id": scene.chat_id, "text": action.text},
                 )
             ]
-            scene.transcript.append(events[0])
             scene.quiet_player_ids.clear()
             scene.quiet_count = 0
             if scene.action_count >= self.action_budget:
@@ -618,9 +671,27 @@ class PrivateChatScheduler:
             payload=base,
         )
 
-    async def _emit(self, events: Sequence[EventRecord]) -> None:
-        if self._event_sink is not None and events:
-            await self._event_sink(tuple(events))
+    async def _emit(self, events: Sequence[EventRecord]) -> tuple[EventRecord, ...]:
+        drafts = tuple(events)
+        if self._event_sink is None or not drafts:
+            return drafts
+        result = await self._event_sink(drafts)
+        if (
+            isinstance(result, Sequence)
+            and len(result) == len(drafts)
+            and all(isinstance(event, EventRecord) for event in result)
+        ):
+            return tuple(result)
+        return drafts
+
+    @staticmethod
+    def _append_committed_transcript(
+        scene: PrivateChatScene,
+        events: Sequence[EventRecord],
+    ) -> None:
+        scene.transcript.extend(
+            event for event in events if event.type == "chat.private_message"
+        )
 
     async def _at_safe_point(self) -> None:
         if self._safe_point is not None:

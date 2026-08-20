@@ -60,6 +60,10 @@ class ModelOutputSegment(BaseModel):
     source_field: str
     text: str
     incomplete: bool = False
+    tool_index: int | None = Field(default=None, exclude_if=lambda value: value is None)
+    tool_call_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    tool_name: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    tool_type: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class EventRecord(BaseModel):

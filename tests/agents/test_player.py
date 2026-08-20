@@ -1,0 +1,516 @@
+from __future__ import annotations
+
+import json
+from collections.abc import AsyncIterator
+from copy import deepcopy
+
+from pydantic import ValidationError
+
+from clocktower.agents.player import (
+    AgentScene,
+    PlayerAgent,
+    ReactionProbe,
+    segment_event,
+)
+from clocktower.config import ResolvedModel
+from clocktower.domain.actions import Nominate, SpeakPublic, YieldAction
+from clocktower.domain.events import Audience, EventRecord
+from clocktower.event_stream import EventStream
+from clocktower.history import HistoryWriter
+from clocktower.models.protocol import ModelRequest, ModelSegment
+from tests.builders import public_claim, sample_game_state
+
+
+class ScriptedAdapter:
+    """Socket-free adapter boundary; the PlayerAgent itself remains real."""
+
+    def __init__(self, *scripts: tuple[ModelSegment, ...]) -> None:
+        self.scripts = list(scripts)
+        self.requests: list[ModelRequest] = []
+
+    async def stream(self, request: ModelRequest) -> AsyncIterator[ModelSegment]:
+        self.requests.append(request)
+        if not self.scripts:
+            raise AssertionError("unexpected model call")
+        for segment in self.scripts.pop(0):
+            yield segment
+
+
+class RecordingResolver:
+    def __init__(self) -> None:
+        self.short_flags: list[bool] = []
+
+    def __call__(self, player_id: str, short: bool) -> ResolvedModel:
+        assert player_id == "alice"
+        self.short_flags.append(short)
+        return ResolvedModel(
+            provider="scripted",
+            name="short" if short else "normal",
+            base_url="https://unused.example/v1",
+            api_key_env="UNUSED_KEY",
+            api_key=None,
+            reasoning_fields=("reasoning_content",),
+            source="tests.short" if short else "tests.normal",
+        )
+
+
+def segment(
+    index: int,
+    kind: str,
+    text: str,
+    *,
+    call_id: str = "call-1",
+    source_field: str | None = None,
+    tool_index: int | None = None,
+    tool_call_id: str | None = None,
+    tool_name: str | None = None,
+    tool_type: str | None = None,
+    incomplete: bool = False,
+) -> ModelSegment:
+    return ModelSegment(
+        call_id=call_id,
+        index=index,
+        kind=kind,  # type: ignore[arg-type]
+        source_field=source_field or ("tool_calls" if kind == "tool_call" else "content"),
+        text=text,
+        incomplete=incomplete,
+        tool_index=tool_index,
+        tool_call_id=tool_call_id,
+        tool_name=tool_name,
+        tool_type=tool_type,
+    )
+
+
+def tool_segment(
+    name: str,
+    arguments: dict[str, object],
+    *,
+    call_id: str,
+    index: int = 0,
+    tool_index: int = 0,
+    tool_call_id: str | None = None,
+) -> ModelSegment:
+    return segment(
+        index,
+        "tool_call",
+        json.dumps(arguments, separators=(",", ":")),
+        call_id=call_id,
+        tool_index=tool_index,
+        tool_call_id=tool_call_id or f"tool-{call_id}-{tool_index}",
+        tool_name=name,
+        tool_type="function",
+    )
+
+
+def build_agent(tmp_path, adapter: ScriptedAdapter):
+    game_state = sample_game_state()
+    game_state.phase = "day.discussion"
+    history = HistoryWriter(tmp_path / "game.jsonl", EventStream())
+    resolver = RecordingResolver()
+    agent = PlayerAgent(
+        player_id="alice",
+        game_state=game_state,
+        resolve_model=resolver,
+        adapter=adapter,
+        history=history,
+    )
+    return agent, game_state, history, resolver
+
+
+def history_records(history: HistoryWriter) -> list[dict[str, object]]:
+    return [
+        json.loads(line)
+        for line in history.path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
+def test_reaction_probe_rejects_non_strict_decisions_and_urgency():
+    """Coercion or an open decision string would let the short model control scheduling."""
+
+    ReactionProbe(decision="respond", urgency=1, action_type="speak")
+
+    try:
+        ReactionProbe(decision="immediately", urgency=1, action_type="speak")
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError("unknown decision was accepted")
+
+    try:
+        ReactionProbe(decision="respond", urgency="15", action_type="speak")
+    except ValidationError:
+        pass
+    else:
+        raise AssertionError("string urgency was coerced")
+
+
+def test_segment_event_preserves_every_provider_field_as_observer_only():
+    """Dropping tool identity fields prevents exact trace reconstruction and result binding."""
+
+    provider_segment = segment(
+        7,
+        "tool_call",
+        '{"text":"hi"}',
+        call_id="provider-call",
+        tool_index=3,
+        tool_call_id="tool-42",
+        tool_name="speak_public",
+        tool_type="function",
+        incomplete=True,
+    )
+
+    event = segment_event("alice", "formal_action", provider_segment, "day.discussion")
+
+    assert event.audience == Audience.observer()
+    assert event.type == "model.output_segment"
+    assert event.payload == {
+        "call_id": "provider-call",
+        "player_id": "alice",
+        "call_purpose": "formal_action",
+        "segment_index": 7,
+        "kind": "tool_call",
+        "source_field": "tool_calls",
+        "text": '{"text":"hi"}',
+        "incomplete": True,
+        "tool_index": 3,
+        "tool_call_id": "tool-42",
+        "tool_name": "speak_public",
+        "tool_type": "function",
+    }
+    assert all(not isinstance(value, ModelSegment) for value in event.payload.values())
+
+
+async def test_run_action_uses_normal_model_and_returns_one_canonical_action_without_publishing_body(tmp_path):
+    """The agent boundary must propose an action; the owning scene decides how to publish it."""
+
+    adapter = ScriptedAdapter(
+        (
+            segment(0, "reasoning", "private thought", source_field="reasoning_content"),
+            tool_segment(
+                "speak_public",
+                {"text": "I claim Chef."},
+                call_id="call-1",
+                index=1,
+                tool_call_id="tool-public",
+            ),
+        )
+    )
+    agent, _state, history, resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene())
+
+    assert resolver.short_flags == [False]
+    assert outcome.action == SpeakPublic(actor="alice", text="I claim Chef.")
+    assert outcome.round_trips == 1
+    records = history_records(history)
+    assert [record["type"] for record in records] == [
+        "model.output_segment",
+        "model.output_segment",
+        "model.output_segment",
+    ]
+    assert all(record["audience"]["kind"] == "observer" for record in records)
+    assert all(record["type"] != "player.public_message" for record in records)
+    result = records[-1]["payload"]
+    assert result["kind"] == "tool_result"
+    assert result["tool_call_id"] == "tool-public"
+    prompt = json.loads(adapter.requests[0].messages[1]["content"])
+    assert prompt["scene"]["phase"] == "day.discussion"
+
+
+async def test_run_action_allows_repeated_notebook_updates_with_adjacent_checkpoints(tmp_path):
+    """Batching notebook changes would lose the required checkpoint after each accepted patch."""
+
+    adapter = ScriptedAdapter(
+        (tool_segment("update_notebook", {"patch": "first"}, call_id="call-1"),),
+        (tool_segment("update_notebook", {"patch": "second"}, call_id="call-2"),),
+        (
+            tool_segment(
+                "nominate",
+                {"target_player": "bob", "accusation": "evasive"},
+                call_id="call-3",
+            ),
+        ),
+    )
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene())
+
+    assert outcome.action == Nominate(actor="alice", target="bob", accusation="evasive")
+    assert game_state.players["alice"].notebook.notes == "second"
+    records = history_records(history)
+    update_indexes = [index for index, record in enumerate(records) if record["type"] == "notebook.updated"]
+    assert len(update_indexes) == 2
+    assert all(records[index + 1]["type"] == "checkpoint" for index in update_indexes)
+    tool_messages = [
+        message
+        for request in adapter.requests[1:]
+        for message in request.messages
+        if message.get("role") == "tool"
+    ]
+    assert [message["tool_call_id"] for message in tool_messages] == [
+        "tool-call-1-0",
+        "tool-call-1-0",
+        "tool-call-2-0",
+    ]
+
+
+async def test_run_action_accepts_at_most_one_outward_action_from_parallel_calls(tmp_path):
+    """Two outward intents in one response must never escape as two game mutations."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "speak_public",
+                {"text": "one"},
+                call_id="call-1",
+                tool_index=0,
+                tool_call_id="tool-one",
+            ),
+            tool_segment(
+                "nominate",
+                {"target_player": "bob", "accusation": "two"},
+                call_id="call-1",
+                index=1,
+                tool_index=1,
+                tool_call_id="tool-two",
+            ),
+        )
+    )
+    agent, _state, history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene())
+
+    assert outcome.action == SpeakPublic(actor="alice", text="one")
+    results = [
+        record["payload"]
+        for record in history_records(history)
+        if record["type"] == "model.output_segment"
+        and record["payload"]["kind"] == "tool_result"
+    ]
+    assert [result["tool_call_id"] for result in results] == ["tool-one", "tool-two"]
+    assert results[1]["text"].startswith('{"error":')
+
+
+async def test_unknown_then_out_of_phase_tool_uses_only_one_correction(tmp_path):
+    """Repeated illegal calls must terminate instead of creating an unbounded correction loop."""
+
+    adapter = ScriptedAdapter(
+        (tool_segment("read_global_state", {}, call_id="call-1"),),
+        (
+            tool_segment(
+                "cast_vote",
+                {"nomination_id": "nom-1", "vote": True},
+                call_id="call-2",
+            ),
+        ),
+    )
+    agent, _state, history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene(required=False))
+
+    assert len(adapter.requests) == 2
+    assert outcome.action == YieldAction(actor="alice", reason="illegal_tool_call")
+    assert outcome.illegal_corrections == 1
+    errors = [
+        record["payload"]
+        for record in history_records(history)
+        if record["payload"].get("kind") == "tool_result"
+    ]
+    assert len(errors) == 2
+    assert all(payload["tool_call_id"] for payload in errors)
+
+
+async def test_required_action_reports_failure_after_second_illegal_tool(tmp_path):
+    """A required choice must stop upstream orchestration rather than silently yielding."""
+
+    adapter = ScriptedAdapter(
+        (tool_segment("unknown", {}, call_id="call-1"),),
+        (tool_segment("unknown_again", {}, call_id="call-2"),),
+    )
+    agent, _state, _history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene(required=True))
+
+    assert outcome.action is None
+    assert outcome.status == "required_action_failed"
+
+
+async def test_required_action_without_a_tool_reports_failure_instead_of_yielding(tmp_path):
+    """A required choice cannot be converted into an optional yield when the model only chats."""
+
+    adapter = ScriptedAdapter(
+        (segment(0, "final_message", "I forgot to choose.", call_id="call-1"),)
+    )
+    agent, _state, _history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene(required=True))
+
+    assert outcome.action is None
+    assert outcome.status == "required_action_failed"
+
+
+async def test_scene_identifier_binding_rejects_cross_chat_action_then_accepts_correction(tmp_path):
+    """A phase-valid private tool must not act on a different private scene."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "speak_private",
+                {"chat_id": "chat-other", "text": "leak"},
+                call_id="call-1",
+            ),
+        ),
+        (
+            tool_segment(
+                "speak_private",
+                {"chat_id": "chat-allowed", "text": "hello"},
+                call_id="call-2",
+            ),
+        ),
+    )
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+    game_state.phase = "day.private"
+
+    outcome = await agent.run_action(
+        AgentScene(details={"chat_id": "chat-allowed"})
+    )
+
+    assert outcome.action is not None
+    assert outcome.action.kind == "speak_private"
+    assert outcome.action.chat_id == "chat-allowed"
+    assert outcome.illegal_corrections == 1
+    first_result = next(
+        record["payload"]
+        for record in history_records(history)
+        if record["payload"].get("kind") == "tool_result"
+    )
+    assert "active scene" in first_result["text"]
+
+
+async def test_tool_arguments_follow_json_schema_types_without_pydantic_coercion(tmp_path):
+    """The string 'yes' is not a legal boolean vote even if a model class could coerce it."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "cast_vote",
+                {"nomination_id": "nom-1", "vote": "yes"},
+                call_id="call-1",
+            ),
+        ),
+        (
+            tool_segment(
+                "cast_vote",
+                {"nomination_id": "nom-1", "vote": True},
+                call_id="call-2",
+            ),
+        ),
+    )
+    agent, game_state, _history, _resolver = build_agent(tmp_path, adapter)
+    game_state.phase = "day.voting"
+
+    outcome = await agent.run_action(
+        AgentScene(details={"nomination_id": "nom-1"})
+    )
+
+    assert outcome.action is not None
+    assert outcome.action.kind == "cast_vote"
+    assert outcome.action.vote is True
+    assert outcome.illegal_corrections == 1
+
+
+async def test_run_action_stops_after_four_tool_round_trips(tmp_path):
+    """Notebook-only responses must still obey the hard model/tool lifecycle budget."""
+
+    scripts = tuple(
+        (tool_segment("update_notebook", {"patch": f"note-{index}"}, call_id=f"call-{index}"),)
+        for index in range(1, 6)
+    )
+    adapter = ScriptedAdapter(*scripts)
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+
+    outcome = await agent.run_action(AgentScene())
+
+    assert len(adapter.requests) == 4
+    assert outcome.round_trips == 4
+    assert outcome.action == YieldAction(actor="alice", reason="tool_round_trip_limit")
+    assert game_state.players["alice"].notebook.notes == "note-4"
+    assert sum(record["type"] == "checkpoint" for record in history_records(history)) == 4
+
+
+async def test_probe_is_short_stateless_tool_free_and_does_not_mutate_agent_state(tmp_path):
+    """A short probe must not join the normal continuation chain or gain game tools."""
+
+    adapter = ScriptedAdapter(
+        (
+            segment(0, "reasoning", "brief thought", call_id="probe-1", source_field="reasoning_content"),
+            segment(
+                1,
+                "final_message",
+                '{"decision":"respond","urgency":4,"action_type":"speak"}',
+                call_id="probe-1",
+            ),
+        ),
+        (
+            segment(
+                0,
+                "final_message",
+                '{"decision":"defer","urgency":0,"action_type":"yield"}',
+                call_id="probe-2",
+            ),
+        ),
+    )
+    agent, game_state, history, resolver = build_agent(tmp_path, adapter)
+    game_state.players["alice"].notebook.notes = "keep me"
+    before = deepcopy(agent.state)
+    trigger = public_claim(actor="bob", mentions={"alice"})
+
+    first = await agent.probe(trigger)
+    second = await agent.probe(trigger)
+
+    assert (first.decision, first.urgency, first.action_type) == ("respond", 4, "speak")
+    assert second.decision == "defer"
+    assert resolver.short_flags == [True, True]
+    assert all(request.model.name == "short" and request.tools == () for request in adapter.requests)
+    assert [len(request.messages) for request in adapter.requests] == [2, 2]
+    assert agent.state == before
+    assert game_state.players["alice"].notebook.notes == "keep me"
+    probe_segments = [
+        record["payload"]
+        for record in history_records(history)
+        if record["type"] == "model.output_segment"
+    ]
+    assert all(payload["call_purpose"] == "reaction_probe" for payload in probe_segments)
+
+
+async def test_probe_malformed_output_safely_degrades_to_silent(tmp_path):
+    """Malformed provider text must not become an unvalidated scheduler instruction."""
+
+    adapter = ScriptedAdapter(
+        (segment(0, "final_message", '{"decision":"rush"}', call_id="probe-bad"),)
+    )
+    agent, _state, _history, _resolver = build_agent(tmp_path, adapter)
+
+    result = await agent.probe(public_claim(actor="bob", mentions={"alice"}))
+
+    assert result == ReactionProbe(decision="silent", urgency=0, action_type="yield")
+
+
+async def test_probe_refuses_observer_only_event_type_even_if_audience_is_mislabeled_public(tmp_path):
+    """A bad audience label must not turn raw observer reasoning into a short-call prompt."""
+
+    adapter = ScriptedAdapter()
+    agent, _state, _history, resolver = build_agent(tmp_path, adapter)
+    observer_trace = EventRecord(
+        phase="day.discussion",
+        type="model.output_segment",
+        actor="bob",
+        audience=Audience.public(),
+        payload={"kind": "reasoning", "text": "DO_NOT_SEND"},
+    )
+
+    result = await agent.probe(observer_trace)
+
+    assert result == ReactionProbe(decision="silent", urgency=0, action_type="yield")
+    assert adapter.requests == []
+    assert resolver.short_flags == []

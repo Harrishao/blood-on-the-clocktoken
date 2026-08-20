@@ -125,6 +125,8 @@ class DiscussionScheduler:
         try:
             outcome = await agent.run_action(scene)
         except ModelCallError:
+            if self._state_provider().stopped:
+                return events + [self._stop_event()]
             try:
                 outcome = await agent.run_action(scene)
             except ModelCallError:
@@ -147,6 +149,8 @@ class DiscussionScheduler:
         adjustments: dict[str, int] = {}
         audit_events: list[EventRecord] = []
         for score in selected:
+            if self._state_provider().stopped:
+                break
             adjustment = 0
             decision = "probe_failed"
             agent = self.agents.get(score.player_id)
@@ -158,10 +162,14 @@ class DiscussionScheduler:
                         decision = "probe_model_call_failed"
                         if attempt == 1:
                             break
+                        if self._state_provider().stopped:
+                            break
                         continue
                     if getattr(probe, "fallback", False):
                         decision = "probe_fallback"
                         if attempt == 1:
+                            break
+                        if self._state_provider().stopped:
                             break
                         continue
                     adjustment, decision = _bounded_adjustment(probe)
@@ -215,7 +223,7 @@ class DiscussionScheduler:
         self.action_counts[selected_id] = self.action_counts.get(selected_id, 0) + 1
         self.last_speaker = selected_id
         self.quiet_count = 0
-        public_events = [event for event in rule_events if event.audience.kind == "public"]
+        public_events = [event for event in rule_events if is_safe_public_event(event)]
         if public_events:
             self.trigger_event = public_events[-1]
         events = list(rule_events)

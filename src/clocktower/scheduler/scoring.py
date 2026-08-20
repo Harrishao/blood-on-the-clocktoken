@@ -143,12 +143,10 @@ def _score_player(
 ) -> CandidateScore:
     matched_attention_players = tuple(sorted(set(attention.players) & set(related_player_ids)))
     matched_watch_triggers = tuple(sorted(set(attention.watch_triggers) & set(trigger_keys)))
+    discussion_actions = {"speak_public", "nominate", "request_private_chat"}
+    safe_explicit_actions = set(action_keys) & discussion_actions
     matched_pending_actions = tuple(
-        sorted(
-            set(attention.pending_actions)
-            & {"speak_public", "nominate"}
-            & set(action_keys)
-        )
+        sorted(set(attention.pending_actions) & (discussion_actions | safe_explicit_actions))
     )
     active = {
         "direct_target": player_id in target_ids,

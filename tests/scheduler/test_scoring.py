@@ -91,7 +91,6 @@ def test_structured_attention_matches_only_the_current_public_event():
         pending_actions=["nominate"],
     )
     claim = public_claim(actor="alice", mentions={"carol"})
-    claim.payload["action_key"] = "nominate"
     unrelated = EventRecord(
         phase="day.discussion",
         type="player.public_message",
@@ -110,7 +109,23 @@ def test_structured_attention_matches_only_the_current_public_event():
     assert matched_features["pending_action"].contribution == 15
     assert "nominate" in matched_features["pending_action"].reason
     assert unmatched_features["trigger"].contribution == 0
-    assert unmatched_features["pending_action"].contribution == 0
+    assert unmatched_features["pending_action"].contribution == 15
+
+
+def test_pending_action_uses_discussion_tool_availability_without_an_event_action_key():
+    """Production public events do not need an artificial action_key to make a pending nomination relevant."""
+
+    state = sample_game_state()
+    state.players["bob"].notebook.attention = NotebookAttention(pending_actions=["nominate"])
+    score = {score.player_id: score for score in score_candidates(public_claim(actor="alice", mentions=set()), state)}["bob"]
+
+    pending = next(feature for feature in score.features if feature.name == "pending_action")
+    assert pending.contribution == 15
+    assert "nominate" in pending.reason
+
+    state.players["bob"].notebook.attention = NotebookAttention(pending_actions=["use_ability"])
+    invalid = {score.player_id: score for score in score_candidates(public_claim(actor="alice", mentions=set()), state)}["bob"]
+    assert next(feature for feature in invalid.features if feature.name == "pending_action").contribution == 0
 
 
 def test_dead_player_with_an_agent_remains_a_discussion_candidate():

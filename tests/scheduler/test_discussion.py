@@ -279,6 +279,77 @@ async def test_stopped_state_ends_at_each_safe_scheduler_boundary():
     assert rules.actions == []
 
 
+async def test_stop_during_first_probe_prevents_second_probe_and_normal_action():
+    """A stop raised within the first short call must be observed before another player is called."""
+
+    scheduler, agents, rules = make_scheduler()
+
+    class StopDuringProbe(ScriptedAgent):
+        async def probe(self, event):
+            result = await super().probe(event)
+            scheduler.test_state.stopped = True
+            return result
+
+    agents["alice"] = StopDuringProbe(action=SpeakPublic(actor="alice", text="must not run"))
+    scheduler.agents = agents
+    events = await scheduler.step()
+
+    assert scheduler.end_reason == "stopped"
+    assert len(agents["alice"].probes) == 1
+    assert all(not agent.probes for player_id, agent in agents.items() if player_id != "alice")
+    assert all(not agent.scenes for agent in agents.values())
+    assert rules.actions == []
+    assert events[-1].type == "scheduler.stopped"
+
+
+async def test_stop_after_first_normal_model_failure_prevents_retry():
+    """A retry scheduled before rechecking stop would issue a model request after the safe boundary."""
+
+    scheduler, agents, rules = make_scheduler()
+
+    class StopOnModelFailure(ScriptedAgent):
+        async def run_action(self, scene):
+            self.scenes.append(scene)
+            scheduler.test_state.stopped = True
+            raise ModelCallError("provider failed")
+
+    agents["alice"] = StopOnModelFailure()
+    scheduler.agents = agents
+    events = await scheduler.step()
+
+    assert scheduler.end_reason == "stopped"
+    assert len(agents["alice"].scenes) == 1
+    assert rules.actions == []
+    assert events[-1].type == "scheduler.stopped"
+
+
+async def test_unsafe_rule_event_does_not_replace_the_last_safe_trigger():
+    """A forged public checkpoint may remain auditable but cannot drive the next discussion step."""
+
+    class UnsafeRules(RecordingRules):
+        def apply_action(self, action):
+            self.actions.append(action)
+            return [
+                EventRecord(
+                    phase="day.discussion",
+                    type="checkpoint",
+                    audience=Audience.public(),
+                    payload={"observer_secret": "not a trigger"},
+                )
+            ]
+
+    scheduler, agents, _rules = make_scheduler()
+    rules = UnsafeRules()
+    scheduler.rules = rules
+    original = scheduler.trigger_event
+
+    events = await scheduler.step()
+
+    assert rules.actions
+    assert scheduler.trigger_event == original
+    assert any(event.type == "checkpoint" for event in events)
+
+
 async def test_quiet_audit_counts_only_candidates_above_threshold():
     """Reporting raw scores as eligible would mislead observers about why a scene ended quietly."""
 

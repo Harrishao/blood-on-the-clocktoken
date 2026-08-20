@@ -81,6 +81,25 @@ name = "alice-normal"
     assert (resolved.name, resolved.source) == ("alice-normal", "players.alice.model")
 
 
+def test_short_model_falls_back_to_player_normal_without_short_models(tmp_path: Path):
+    path = tmp_path / "config.toml"
+    write_config(path, """
+[providers.main]
+base_url = "https://example.test/v1"
+api_key_env = "TEST_KEY"
+[models.global]
+provider = "main"
+name = "normal"
+[players.alice.model]
+provider = "main"
+name = "alice-normal"
+""")
+
+    resolved = AppConfig.load(path).resolve_model("alice", short=True)
+
+    assert (resolved.name, resolved.source) == ("alice-normal", "players.alice.model")
+
+
 def test_short_model_falls_back_to_global_normal(tmp_path: Path):
     path = tmp_path / "config.toml"
     write_config(path, """

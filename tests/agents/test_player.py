@@ -10,6 +10,7 @@ from pydantic import ValidationError
 from clocktower.agents.player import (
     AgentScene,
     PlayerAgent,
+    PrivateInvitationResponse,
     ReactionProbe,
     segment_event,
 )
@@ -970,3 +971,105 @@ async def test_probe_refuses_observer_only_event_type_even_if_audience_is_mislab
     assert result == ReactionProbe(decision="silent", urgency=0, action_type="yield")
     assert adapter.requests == []
     assert resolver.short_flags == []
+
+
+async def test_private_invitation_response_is_short_stateless_and_private_to_the_invitee(tmp_path):
+    """Invitation consent is a dedicated short call, never a normal continuation or tool turn."""
+
+    adapter = ScriptedAdapter(
+        (
+            segment(
+                0,
+                "final_message",
+                '{"decision":"accept"}',
+                call_id="invite-1",
+            ),
+        )
+    )
+    agent, game_state, history, resolver = build_agent(tmp_path, adapter)
+    game_state.phase = "day.discussion"
+    before = deepcopy(agent.state)
+    invitation = EventRecord(
+        phase="day.private_invite",
+        type="chat.private_invitation",
+        actor="bob",
+        audience=Audience.player("alice"),
+        payload={"request_id": "invite-1", "inviter": "bob"},
+    )
+
+    result = await agent.respond_private_invitation(invitation)
+
+    assert result == PrivateInvitationResponse(decision="accept")
+    assert resolver.short_flags == [True]
+    assert adapter.requests[0].tools == ()
+    assert len(adapter.requests[0].messages) == 2
+    assert agent.state == before
+    assert all(record["payload"]["call_purpose"] == "private_invitation_response" for record in history_records(history))
+    prompt = json.loads(adapter.requests[0].messages[1]["content"])
+    assert prompt["invitation"]["payload"]["inviter"] == "bob"
+
+
+async def test_private_invitation_response_rejects_an_unauthorized_or_malformed_event_without_calling_a_model(tmp_path):
+    """A public or malformed invitation cannot be promoted into private consent."""
+
+    adapter = ScriptedAdapter()
+    agent, _state, _history, resolver = build_agent(tmp_path, adapter)
+    forged = EventRecord(
+        phase="day.private_invite",
+        type="chat.private_invitation",
+        actor="bob",
+        audience=Audience.public(),
+        payload={"request_id": "invite-1", "inviter": "bob"},
+    )
+
+    result = await agent.respond_private_invitation(forged)
+
+    assert result.fallback is True
+    assert result.decision == "defer"
+    assert adapter.requests == []
+    assert resolver.short_flags == []
+
+
+async def test_private_scene_context_excludes_public_and_other_chat_events(tmp_path):
+    """Private model prompts may contain only the exact two-person chat event stream."""
+
+    adapter = ScriptedAdapter(
+        (
+            tool_segment(
+                "speak_private",
+                {"chat_id": "chat-a", "text": "only ours"},
+                call_id="private-1",
+            ),
+        )
+    )
+    agent, game_state, history, _resolver = build_agent(tmp_path, adapter)
+    game_state.phase = "day.private"
+    await history.append(public_claim(actor="bob", mentions={"alice"}))
+    await history.append(
+        EventRecord(
+            phase="day.private",
+            type="chat.private_message",
+            audience=Audience.players({"alice", "carol"}),
+            payload={"chat_id": "chat-other", "text": "do not disclose"},
+        )
+    )
+    await history.append(
+        EventRecord(
+            phase="day.private",
+            type="chat.private_message",
+            audience=Audience.players({"alice", "bob"}),
+            payload={"chat_id": "chat-a", "text": "permitted"},
+        )
+    )
+
+    await agent.run_action(
+        AgentScene(
+            phase="day.private",
+            allowed_tools=("speak_private", "leave_private_chat", "update_notebook", "yield_action"),
+            private_context_only=True,
+            details={"chat_id": "chat-a", "participants": ["alice", "bob"]},
+        )
+    )
+
+    prompt = json.loads(adapter.requests[0].messages[1]["content"])
+    assert [event["payload"].get("chat_id") for event in prompt["events"]] == ["chat-a"]

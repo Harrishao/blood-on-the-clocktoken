@@ -48,6 +48,7 @@ class AgentScene(BaseModel):
     purpose: str = "formal_action"
     required: bool = False
     allowed_tools: tuple[str, ...] | None = None
+    private_context_only: bool = False
     details: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -72,6 +73,27 @@ class ReactionProbe(BaseModel):
         probe = cls.model_construct(decision="silent", urgency=0, action_type="yield")
         probe._fallback = True
         return probe
+
+
+class PrivateInvitationResponse(BaseModel):
+    """A stateless short-model decision about one private-chat invitation."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    decision: Literal["accept", "reject", "defer"]
+    _fallback: bool = PrivateAttr(default=False)
+
+    @property
+    def fallback(self) -> bool:
+        """Whether local parsing supplied the safe no-chat response."""
+
+        return self._fallback
+
+    @classmethod
+    def fallback_defer(cls) -> PrivateInvitationResponse:
+        response = cls.model_construct(decision="defer")
+        response._fallback = True
+        return response
 
 
 class AgentOutcome(BaseModel):
@@ -205,6 +227,8 @@ class PlayerAgent:
                     round_state,
                     phase,
                     round_scene.allowed_tools,
+                    private_context_only=round_scene.private_context_only,
+                    participants=round_scene.details.get("participants"),
                 )
                 context = self._apply_scene_tool_policy(context, round_scene)
                 messages = [
@@ -383,6 +407,68 @@ class PlayerAgent:
         except (ValidationError, ValueError):
             return self._silent_probe(fallback=True)
 
+    async def respond_private_invitation(
+        self,
+        invitation: EventRecord,
+    ) -> PrivateInvitationResponse:
+        """Make one isolated, tool-free short decision for an invitee-only event."""
+
+        live_state = self._current_state()
+        projected_state = live_state.model_copy(
+            update={"phase": invitation.phase or live_state.phase}, deep=True
+        )
+        invitation_context = project_context(self.player_id, projected_state, (invitation,))
+        if (
+            len(invitation_context.events) != 1
+            or invitation_context.events[0].type != "chat.private_invitation"
+            or invitation.audience.kind != "player"
+            or invitation.audience.player_ids != frozenset({self.player_id})
+        ):
+            return PrivateInvitationResponse.fallback_defer()
+
+        private_event = invitation_context.events[0]
+        player = live_state.players[self.player_id]
+        prompt = {
+            "identity": player.perceived_identity,
+            "alignment": player.known_alignment,
+            "ability_text": player.perceived_ability_text,
+            "notebook": player.notebook.model_dump(mode="json"),
+            "invitation": private_event.model_dump(mode="json"),
+        }
+        messages: tuple[Mapping[str, Any], ...] = (
+            {
+                "role": "system",
+                "content": (
+                    "Return only JSON with decision accept, reject, or defer. "
+                    "This is a private invitation response, not a game tool action."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(prompt, ensure_ascii=False, separators=(",", ":")),
+            },
+        )
+        resolved = self._resolve_model(short=True)
+        request = ModelRequest(
+            call_id=f"{self.player_id}-private-invitation-{next(self._call_numbers)}",
+            model=resolved,
+            messages=messages,
+            tools=(),
+            tool_choice=None,
+        )
+        segments = await self._record_stream(
+            request,
+            "private_invitation_response",
+            invitation.phase or live_state.phase,
+        )
+        content = "".join(
+            segment.text for segment in segments if segment.kind == "final_message"
+        )
+        try:
+            return PrivateInvitationResponse.model_validate_json(content)
+        except (ValidationError, ValueError):
+            return PrivateInvitationResponse.fallback_defer()
+
     def _resolve_model(self, *, short: bool) -> ResolvedModel:
         resolver = self._model_resolver
         if callable(resolver):
@@ -397,6 +483,9 @@ class PlayerAgent:
         game_state: GameState,
         phase: str,
         allowed_tools: tuple[str, ...] | None,
+        *,
+        private_context_only: bool = False,
+        participants: object = None,
     ) -> tuple[PlayerContext, tuple[EventRecord, ...]]:
         source_events = tuple(self._event_source())
         new_events = tuple(
@@ -404,6 +493,20 @@ class PlayerAgent:
             for event in source_events
             if event.seq == 0 or event.seq > self.state.event_cursor
         )
+        if private_context_only:
+            participant_ids = (
+                frozenset(participants)
+                if isinstance(participants, (list, tuple))
+                and len(participants) == 2
+                and all(isinstance(player_id, str) for player_id in participants)
+                else frozenset()
+            )
+            new_events = tuple(
+                event
+                for event in new_events
+                if event.audience.kind == "players"
+                and event.audience.player_ids == participant_ids
+            )
         projected_state = game_state.model_copy(update={"phase": phase}, deep=True)
         context = project_context(self.player_id, projected_state, new_events)
         if allowed_tools is not None:
@@ -543,6 +646,8 @@ class PlayerAgent:
                     live_state,
                     live_phase,
                     live_scene.allowed_tools,
+                    private_context_only=live_scene.private_context_only,
+                    participants=live_scene.details.get("participants"),
                 )
                 live_context = self._apply_scene_tool_policy(
                     live_context,
@@ -752,6 +857,7 @@ __all__ = [
     "AgentScene",
     "PlayerAgent",
     "PlayerAgentState",
+    "PrivateInvitationResponse",
     "ReactionProbe",
     "segment_event",
 ]

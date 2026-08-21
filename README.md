@@ -16,10 +16,10 @@ cd web
 npm install
 npm run build
 cd ..
-.\.venv\Scripts\python.exe -m uvicorn clocktower.main:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn clocktower.main:app --host 127.0.0.1 --port 4396
 ```
 
-随后打开 `http://127.0.0.1:8000`。FastAPI 同源提供前端静态文件、`/api` 控制接口与 SSE 实时事件；静态根路由不会替代 `/api`。
+随后打开 `http://127.0.0.1:4396`。FastAPI 同源提供前端静态文件、`/api` 控制接口与 SSE 实时事件；静态根路由不会替代 `/api`。
 
 服务启动时会从 `config.toml` 自动开始唯一一局游戏。游戏结束后若要开始新局，请停止并重新启动进程。历史写入 `game.history_directory` 指定的目录；页面中的 Open history 通过浏览器本地文件选择器读取 JSONL，不会上传文件。
 

@@ -1161,7 +1161,7 @@ cd web
 npm install
 npm run build
 cd ..
-.\.venv\Scripts\python.exe -m uvicorn clocktower.main:app --host 127.0.0.1 --port 8000
+.\.venv\Scripts\python.exe -m uvicorn clocktower.main:app --host 127.0.0.1 --port 4396
 ```
 
 - [ ] **Step 4: Run all automated verification**
@@ -1186,7 +1186,7 @@ Expected: a deterministic five-player game reaches `game.ended`; its JSONL reope
 
 - [ ] **Step 6: Perform manual local-browser acceptance**
 
-Run the README command, then verify at `http://127.0.0.1:8000`:
+Run the README command, then verify at `http://127.0.0.1:4396`:
 
 1. Live events append in order and player identities are visually distinct.
 2. `reasoning_content`/`thinking`, tools, results, and public text appear in returned order.
